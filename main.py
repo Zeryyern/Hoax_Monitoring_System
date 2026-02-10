@@ -1,10 +1,17 @@
-from builtins import len, print
+from storage.storage import init_db, save_articles
 from scraper.fetch import fetch_all
+from builtins import print, len
+
+
+def main():
+    init_db()
+
+    articles = fetch_all()
+    print(f"\nTOTAL ARTICLES COLLECTED: {len(articles)}")
+
+    inserted = save_articles(articles)
+    print(f"NEW ARTICLES INSERTED INTO DB: {inserted}")
+
 
 if __name__ == "__main__":
-    articles, status = fetch_all()
-    print("\n === SOURCE STATUS === ")
-    for src, info in status.items():
-        print(src, "->", info)
-
-    print(f"TOTAL ARTICLES COLLECTED: {len(articles)}")
+    main()

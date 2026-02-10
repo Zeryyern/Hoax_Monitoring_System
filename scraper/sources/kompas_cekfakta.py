@@ -1,4 +1,4 @@
-from builtins import hasattr, len, print
+from builtins import RuntimeError, hasattr, len, print
 import feedparser # type: ignore
 from datetime import datetime, timezone
 

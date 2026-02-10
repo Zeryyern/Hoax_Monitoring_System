@@ -18,7 +18,7 @@ def clean_text(text: str) -> str:
 
 
 def scrape_tempo_hoax(limit: int = 20):
-    raise RuntimeError("INTENTIONAL ERROR")
+    #raise RuntimeError("INTENTIONAL ERROR")
     feed = feedparser.parse(RSS_URL)
     results = []
 
