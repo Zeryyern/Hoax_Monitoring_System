@@ -29,9 +29,52 @@ def init_db():
         fetched_at TEXT NOT NULL
     )
     """)
+    #Runs tables
+    cursor.execute("""CREATE TABLE IF NOT EXISTS runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_time TEXT NOT NULL,
+        total_collected INTEGER NOT NULL,
+        new_inserted INTEGER NOT NULL,
+        status TEXT NOT NULL
+    )
+    """)
+    #source runs table
+    cursor.execute(""" 
+                   CREATE TABLE IF NOT EXISTS source_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_name TEXT NOT NULL,
+        run_time TEXT NOT NULL,
+        status TEXT NOT NULL,
+        articles_collected INTEGER NOT NULL)
+    """)
+    
+    conn.commit()
+    conn.close()
+
+def log_run(total_collected: int, new_inserted: int, status: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO runs (run_time, total_collected, new_inserted, status)
+        VALUES (datetime('now'), ?, ?, ?)
+    """, (total_collected, new_inserted, status))
 
     conn.commit()
     conn.close()
+
+def log_source_run(source_name: str, status: str, count: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO source_runs (source_name, run_time, status, articles_collected)
+        VALUES (?, datetime('now'), ?, ?)
+    """, (source_name, status, count))
+
+    conn.commit()
+    conn.close()
+
 
 def migrate_add_content_hash():
     conn = get_connection()
