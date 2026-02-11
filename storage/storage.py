@@ -1,4 +1,5 @@
 import sqlite3
+import hashlib
 from pathlib import Path
 from typing import List, Dict
 
@@ -10,6 +11,9 @@ DB_PATH = BASE_DIR / "data" / "hoax.db"
 def get_connection():
     return sqlite3.connect(DB_PATH)
 
+def generate_content_hash(source, title, published_at):
+    base = f"{source}|{title.strip().lower()}|{published_at or ''}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 def init_db():
     conn = get_connection()
@@ -29,6 +33,24 @@ def init_db():
     conn.commit()
     conn.close()
 
+def migrate_add_content_hash():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("PRAGMA table_info(hoaxes)")
+    columns = [col[1] for col in cursor.fetchall()]
+
+    if "content_hash" not in columns:
+        cursor.execute("""
+            ALTER TABLE hoaxes
+            ADD COLUMN content_hash TEXT
+        """)
+        conn.commit()
+        print("[MIGRATION] content_hash column added")
+    else:
+        print("[MIGRATION] content_hash already exists")
+
+    conn.close()
 
 def save_articles(articles: List[Dict]) -> int:
     """
@@ -46,16 +68,24 @@ def save_articles(articles: List[Dict]) -> int:
 
     for item in articles:
         try:
+            # Generate stable content identity
+            content_hash = generate_content_hash(
+                item.get("source"),
+                item.get("title"),
+                item.get("date")
+            )
+
             cursor.execute("""
                 INSERT OR IGNORE INTO hoaxes
-                (source, title, url, published_at, fetched_at)
-                VALUES (?, ?, ?, ?, ?)
+                (source, title, url, published_at, fetched_at, content_hash)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 item.get("source"),
                 item.get("title"),
                 item.get("url"),
                 item.get("date"),
-                item.get("fetched_at")
+                item.get("fetched_at"),
+                content_hash
             ))
 
             if cursor.rowcount == 1:
