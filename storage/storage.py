@@ -9,7 +9,9 @@ DB_PATH = BASE_DIR / "data" / "hoax.db"
 
 
 def get_connection():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def generate_content_hash(source, title, published_at):
     base = f"{source}|{title.strip().lower()}|{published_at or ''}"
@@ -141,3 +143,46 @@ def save_articles(articles: List[Dict]) -> int:
     conn.close()
 
     return inserted
+
+#adding simple query functions for analysis purposes
+def get_total_articles():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*) FROM hoaxes")
+    total = cursor.fetchone()[0]
+
+    conn.close()
+    return total
+
+
+def get_articles_per_source():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT source, COUNT(*) 
+        FROM hoaxes 
+        GROUP BY source
+        ORDER BY COUNT(*) DESC
+    """)
+
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+
+def get_recent_runs(limit: int = 5):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT run_time, total_collected, new_inserted, status
+        FROM runs
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,))
+
+    results = cursor.fetchall()
+    conn.close()
+    return results
