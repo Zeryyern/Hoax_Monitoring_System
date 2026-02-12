@@ -1,0 +1,45 @@
+import requests
+from bs4 import BeautifulSoup
+from storage.storage import (
+    get_articles_without_content,
+    update_article_content
+)
+
+def extract_main_text(url: str) -> str:
+    try:
+        response = requests.get(url, timeout=10, allow_redirects=True)
+        final_url = response.url # after redirects
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        paragraphs = soup.find_all("p")
+        text = " ".join(p.get_text(strip=True) for p in paragraphs)
+        if len(text) < 200:
+            print(f"[WARNING] extracted content too short from {final_url}")
+            return None
+        
+        return text.strip()
+
+    except Exception as e:
+        print(f"[EXTRACTION ERROR] {url} → {e}")
+        return None
+
+def process_articles(limit: int = 10):
+    articles = get_articles_without_content(limit)
+
+    if not articles:
+        print("[INFO] No articles to process.")
+        return
+
+    for article in articles:
+        article_id = article["id"]
+        url = article["url"]
+
+        print(f"[PROCESSING] {url}")
+
+        content = extract_main_text(url)
+
+        if content:
+            update_article_content(article_id, content)
+            print("[SUCCESS] Content saved.")
+        else:
+            print("[FAILED] No content extracted.")

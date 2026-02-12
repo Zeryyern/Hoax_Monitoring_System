@@ -1,43 +1,65 @@
-from builtins import RuntimeError, hasattr, len, print
-import feedparser # type: ignore
+from builtins import len, print
+import requests
+from bs4 import BeautifulSoup
 from datetime import datetime, timezone
+import time
 
 SOURCE_NAME = "Kompas Cek Fakta"
+BASE_URL = "https://cekfakta.kompas.com/"
 
-RSS_URL = (
-    "https://news.google.com/rss/search?"
-    "q=site:cekfakta.kompas.com+(hoaks+OR+fakta)"
-    "&hl=id&gl=ID&ceid=ID:id"
-)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+}
 
-def scrape_kompas_cekfakta():
-    feed = feedparser.parse(RSS_URL)
+
+def scrape_kompas_cekfakta(pages=3):
     articles = []
+    seen = set()
 
-    for entry in feed.entries:
-        published_date = None
-        published_time = None
+    for page in range(1, pages + 1):
+        url = BASE_URL if page == 1 else f"{BASE_URL}?page={page}"
+        r = requests.get(url, headers=HEADERS, timeout=20)
 
-        if hasattr(entry, "published_parsed") and entry.published_parsed:
-            dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-            published_date = dt.date().isoformat()
-            published_time = dt.time().isoformat()
+        print(f"STATUS page {page}: {r.status_code}")
 
-        articles.append({
-            "source": SOURCE_NAME,
-            "title": entry.title,
-            "url": entry.link,
-            "published_date": published_date,
-            "published_time": published_time,
-            "summary": entry.summary if hasattr(entry, "summary") else "",
-            "scraped_at": datetime.now(timezone.utc).isoformat()
-        })
+        if r.status_code != 200:
+            continue
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            title = a.get_text(strip=True)
+
+            if not title:
+                continue
+
+            if "/read/" not in href:
+                continue
+
+            if href.startswith("/"):
+                href = "https://cekfakta.kompas.com" + href
+
+            key = (title, href)
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            articles.append({
+                "source": SOURCE_NAME,
+                "title": title,
+                "url": href,
+                "scraped_at": datetime.now(timezone.utc).isoformat()
+            })
+
+        time.sleep(1)
 
     return articles
 
 
 if __name__ == "__main__":
-    results = scrape_kompas_cekfakta()
-    print(f"TOTAL ARTICLES: {len(results)}\n")
+    results = scrape_kompas_cekfakta(pages=2)
+    print(f"\nTOTAL ARTICLES: {len(results)}\n")
     for r in results:
         print(r)

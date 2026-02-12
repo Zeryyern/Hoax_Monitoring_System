@@ -6,7 +6,16 @@ from scraper.sources.detik_hoax import scrape_detik_hoax
 from scraper.sources.tempo_hoax import scrape_tempo_hoax
 from scraper.sources.kompas_cekfakta import scrape_kompas_cekfakta
 from scraper.sources.antaranews import scrape_antaranews
-from scraper.sources.turnbackhoax import fetch_turnbackhoax as scrape_turnbackhoax
+from scraper.sources.turnbackhoax import scrape_turnbackhoax
+
+#health checker function
+def get_health_status(count):
+    if count == 0:
+        return "DOWN ❌"
+    elif count < 5:
+        return "DEGRADED ⚠️"
+    return "HEALTHY ✅"
+
 
 def safe_run(scraper_func, source_name):
     print(f"\n[START] {source_name}")
@@ -14,14 +23,20 @@ def safe_run(scraper_func, source_name):
     try:
         data = scraper_func()
         count = len(data)
-        print(f"[SUCCESS] {source_name} → {len(data)} raw articles")
+
+        health = get_health_status(count)
+
+        print(f"[SUCCESS] {source_name} → {count} raw articles")
+        print(f"[HEALTH] {source_name}: {health}")
+
         log_source_run(source_name, "SUCCESS", count)
         return data
 
     except Exception as e:
-        print(f"[ERROR] {source_name} is DOWN")
+        print(f"[ERROR] {source_name} is DOWN ❌")
         print(f"Reason: {e}")
         traceback.print_exc()
+
         log_source_run(source_name, "FAILURE", 0)
         return []
 

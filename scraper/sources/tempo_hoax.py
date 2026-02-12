@@ -1,54 +1,65 @@
-from builtins import RuntimeError, int, len, print, str
-import feedparser # type: ignore
+from builtins import len, print
+import requests
+from bs4 import BeautifulSoup
 from datetime import datetime, timezone
-import re
+import time
 
-RSS_URL = (
-    "https://news.google.com/rss/search?"
-    "q=site:tempo.co+hoax&hl=id&gl=ID&ceid=ID:id"
-)
+SOURCE_NAME = "Tempo Hoax"
+BASE_URL = "https://cekfakta.tempo.co/"
 
-
-def clean_text(text: str) -> str:
-    """Remove HTML tags and extra spaces."""
-    if not text:
-        return ""
-    text = re.sub(r"<[^>]+>", "", text)
-    return " ".join(text.split())
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+}
 
 
-def scrape_tempo_hoax(limit: int = 20):
-    #raise RuntimeError("INTENTIONAL ERROR")
-    feed = feedparser.parse(RSS_URL)
-    results = []
+def scrape_tempo_hoax(pages=3):
+    articles = []
+    seen = set()
 
-    for entry in feed.entries[:limit]:
-        published = entry.get("published_parsed")
+    for page in range(1, pages + 1):
+        url = BASE_URL if page == 1 else f"{BASE_URL}?page={page}"
+        r = requests.get(url, headers=HEADERS, timeout=20)
 
-        if published:
-            dt = datetime(*published[:6], tzinfo=timezone.utc)
-            published_date = dt.date().isoformat()
-            published_time = dt.time().isoformat()
-        else:
-            published_date = ""
-            published_time = ""
+        print(f"STATUS page {page}: {r.status_code}")
 
-        results.append({
-            "source": "Tempo Hoax",
-            "title": clean_text(entry.get("title", "")),
-            "url": entry.get("link", ""),
-            "published_date": published_date,
-            "published_time": published_time,
-            "summary": clean_text(entry.get("summary", "")),
-            "scraped_at": datetime.now(timezone.utc).isoformat()
-        })
+        if r.status_code != 200:
+            continue
 
-    return results
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            title = a.get_text(strip=True)
+
+            if not title:
+                continue
+
+            if "/read/" not in href:
+                continue
+
+            if href.startswith("/"):
+                href = "https://cekfakta.tempo.co" + href
+
+            key = (title, href)
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            articles.append({
+                "source": SOURCE_NAME,
+                "title": title,
+                "url": href,
+                "scraped_at": datetime.now(timezone.utc).isoformat()
+            })
+
+        time.sleep(1)
+
+    return articles
 
 
 if __name__ == "__main__":
-    articles = scrape_tempo_hoax(limit=25)
-
-    print(f"TOTAL ARTICLES: {len(articles)}\n")
-    for a in articles:
-        print(a)
+    results = scrape_tempo_hoax(pages=2)
+    print(f"\nTOTAL ARTICLES: {len(results)}\n")
+    for r in results:
+        print(r)

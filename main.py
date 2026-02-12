@@ -1,5 +1,6 @@
 from storage.storage import (
     init_db,
+    migrate_add_content_column,
     migrate_add_content_hash,
     save_articles,
     log_run,
@@ -7,13 +8,14 @@ from storage.storage import (
     get_articles_per_source,
     get_recent_runs
 )
-
+from processor.content_extractor import process_articles
 from scraper.fetch import fetch_all
 
 
 def main():
     # Initialize system
     init_db()
+    migrate_add_content_column()
     migrate_add_content_hash()
 
     # Fetch data
@@ -46,7 +48,9 @@ def main():
             f"Inserted: {run['new_inserted']}, "
             f"Status: {run['status']}"
         )
-
-
+    
+    #process article contents
+    print("\n=== PROCESSING ARTICLE CONTENTS ===")
+    process_articles(limit=5)
 if __name__ == "__main__":
     main()
