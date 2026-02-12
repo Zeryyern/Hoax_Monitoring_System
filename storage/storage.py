@@ -52,6 +52,51 @@ def init_db():
     
     conn.commit()
     conn.close()
+def migrate_add_content_column():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("PRAGMA table_info(hoaxes)")
+    columns = [col[1] for col in cursor.fetchall()]
+
+    if "content" not in columns:
+        cursor.execute("""
+            ALTER TABLE hoaxes
+            ADD COLUMN content TEXT
+        """)
+        conn.commit()
+        print("[MIGRATION] content column added")
+    else:
+        print("[MIGRATION] content already exists")
+
+    conn.close()
+
+def get_articles_without_content(limit: int = 20):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, url, source
+        FROM hoaxes
+        WHERE content IS NULL
+        LIMIT ?
+    """, (limit,))
+
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+def update_article_content(article_id: int, content: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE hoaxes
+        SET content = ?
+        WHERE id = ?
+    """, (content, article_id))
+
+    conn.commit()
+    conn.close()
 
 def log_run(total_collected: int, new_inserted: int, status: str):
     conn = get_connection()
