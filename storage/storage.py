@@ -1,11 +1,14 @@
+from builtins import str
 import sqlite3
 import hashlib
 from pathlib import Path
 from typing import List, Dict
+from logger import logger
 
 # Project root
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "data" / "hoax.db"
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 def get_connection():
@@ -49,9 +52,19 @@ def init_db():
         status TEXT NOT NULL,
         articles_collected INTEGER NOT NULL)
     """)
+    #cursor.execute("""
+     #   CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_content_hash 
+     #   ON hoaxes(content_hash)
+    #""")
+
+    # Indexes for faster queries
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_source ON hoaxes(source)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_published_at ON hoaxes(published_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_content_hash ON hoaxes(content_hash)")
     
     conn.commit()
     conn.close()
+    
 def migrate_add_content_column():
     conn = get_connection()
     cursor = conn.cursor()
@@ -65,9 +78,10 @@ def migrate_add_content_column():
             ADD COLUMN content TEXT
         """)
         conn.commit()
-        print("[MIGRATION] content column added")
+        logger.info("[MIGRATION] content column added")
+       
     else:
-        print("[MIGRATION] content already exists")
+        logger.info("[MIGRATION] content column already exists")
 
     conn.close()
 
@@ -136,10 +150,10 @@ def migrate_add_content_hash():
             ADD COLUMN content_hash TEXT
         """)
         conn.commit()
-        print("[MIGRATION] content_hash column added")
+        logger.info("[MIGRATION] content_hash column added")
+        
     else:
-        print("[MIGRATION] content_hash already exists")
-
+        logger.info("[MIGRATION] content_hash column already exists")
     conn.close()
 
 def save_articles(articles: List[Dict]) -> int:
@@ -159,11 +173,14 @@ def save_articles(articles: List[Dict]) -> int:
     for item in articles:
         try:
             # Generate stable content identity
-            content_hash = generate_content_hash(
-                item.get("source"),
-                item.get("title"),
-                item.get("date")
-            )
+            source = item.get("source", "").strip()
+            title = item.get("title", "").strip()
+            date = item.get("date")
+            if not source or not title:
+                logger.warning("Skipped article with missing source/title")
+                continue
+            content_hash = generate_content_hash(source, title, date)
+
 
             cursor.execute("""
                 INSERT OR IGNORE INTO hoaxes
@@ -182,7 +199,7 @@ def save_articles(articles: List[Dict]) -> int:
                 inserted += 1
 
         except Exception as e:
-            print(f"[DB ERROR] {e}")
+            logger.error(f"Database inser Error: {str(e)}")
 
     conn.commit()
     conn.close()

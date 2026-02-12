@@ -1,3 +1,4 @@
+from builtins import print
 from storage.storage import (
     init_db,
     migrate_add_content_column,
@@ -10,47 +11,55 @@ from storage.storage import (
 )
 from processor.content_extractor import process_articles
 from scraper.fetch import fetch_all
-
+from logger import logger
 
 def main():
-    # Initialize system
-    init_db()
-    migrate_add_content_column()
-    migrate_add_content_hash()
+    try:
+        logger.info("System run started")
 
-    # Fetch data
-    articles = fetch_all()
-    total = len(articles)
+        # Initialize system
+        init_db()
+        migrate_add_content_column()
+        migrate_add_content_hash()
 
-    # Save to DB
-    inserted = save_articles(articles)
+        # Fetch data
+        articles = fetch_all()
+        total = len(articles)
 
-    print(f"\nTOTAL ARTICLES COLLECTED: {total}")
-    print(f"NEW ARTICLES INSERTED INTO DB: {inserted}")
+        # Save to DB
+        inserted = save_articles(articles)
 
-    # Log system run
-    log_run(total, inserted, "SUCCESS")
+        logger.info(f"TOTAL ARTICLES COLLECTED: {total}")
+        logger.info(f"NEW ARTICLES INSERTED INTO DB: {inserted}")
 
-    # Analytics
-    print("\n=== DATABASE ANALYTICS ===")
+        # Log system run
+        log_run(total, inserted, "SUCCESS")
 
-    print("\nTotal Stored Articles:", get_total_articles())
+        # Analytics
+        logger.info("=== DATABASE ANALYTICS ===")
+        logger.info(f"Total Stored Articles: {get_total_articles()}")
 
-    print("\nArticles per Source:")
-    for source, count in get_articles_per_source():
-        print(f" - {source}: {count}")
+        logger.info("Articles per Source:")
+        for source, count in get_articles_per_source():
+            logger.info(f"{source}: {count}")
 
-    print("\nRecent Runs:")
-    for run in get_recent_runs():
-        print(
-            f" - Time: {run['run_time']}, "
-            f"Collected: {run['total_collected']}, "
-            f"Inserted: {run['new_inserted']}, "
-            f"Status: {run['status']}"
-        )
-    
-    #process article contents
-    print("\n=== PROCESSING ARTICLE CONTENTS ===")
-    process_articles(limit=5)
+        logger.info("Recent Runs:")
+        for run in get_recent_runs():
+            logger.info(
+                f"Time: {run['run_time']} | "
+                f"Collected: {run['total_collected']} | "
+                f"Inserted: {run['new_inserted']} | "
+                f"Status: {run['status']}"
+            )
+
+        logger.info("=== PROCESSING ARTICLE CONTENTS ===")
+        process_articles(limit=5)
+
+        logger.info("System run completed successfully")
+
+    except Exception as e:
+        logger.error(f"System run failed: {str(e)}")
+        log_run(0, 0, "FAILED")
+
 if __name__ == "__main__":
     main()
