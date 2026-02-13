@@ -4,6 +4,8 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 import time
 
+from scraper.utils import is_valid_article_url
+
 SOURCE_NAME = "Tempo Hoax"
 BASE_URL = "https://cekfakta.tempo.co/"
 
@@ -40,6 +42,10 @@ def scrape_tempo_hoax(pages=3):
             if href.startswith("/"):
                 href = "https://cekfakta.tempo.co" + href
 
+            #after url normalization and before storing, check validity
+            if not is_valid_article_url(href, "cekfakta.tempo.co"):
+                continue
+            
             key = (title, href)
             if key in seen:
                 continue

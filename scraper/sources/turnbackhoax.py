@@ -2,6 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 import time
+from scraper.utils import is_valid_article_url
 
 SOURCE_NAME = "TurnBackHoax"
 BASE_URL = "https://turnbackhoax.id/"
@@ -15,7 +16,7 @@ HEADERS = {
 }
 
 
-def scrape_turnbackhoax(pages=1):
+def scrape_turnbackhoax(pages=3):
     session = requests.Session()
     session.headers.update(HEADERS)
 
@@ -36,22 +37,23 @@ def scrape_turnbackhoax(pages=1):
             continue
 
         soup = BeautifulSoup(response.text, "html.parser")
+        for a in soup.find_all("a", href=True): 
+            href = a["href"]
+            title = a.get_text(strip=True)
 
-        for h2 in soup.find_all("a", href=True):
-            href = h2["href"]
-            title = h2.get_text(strip=True)
-
+            # Skip empty titles
             if not title:
                 continue
-
-
+            # Normalize relative URLs
             if href.startswith("/"):
                 href = BASE_URL.rstrip("/") + href
 
+            # 🔹 Filter invalid / non-article URLs
+            if not is_valid_article_url(href, "turnbackhoax.id"):
+                continue
             key = (title, href)
             if key in seen:
                 continue
-
             seen.add(key)
 
             articles.append({

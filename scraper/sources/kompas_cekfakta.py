@@ -4,6 +4,8 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 import time
 
+from scraper.utils import is_valid_article_url
+
 SOURCE_NAME = "Kompas Cek Fakta"
 BASE_URL = "https://cekfakta.kompas.com/"
 
@@ -39,6 +41,11 @@ def scrape_kompas_cekfakta(pages=3):
 
             if href.startswith("/"):
                 href = "https://cekfakta.kompas.com" + href
+                
+            #after url normalization and before storing check if url is valid!
+            if not is_valid_article_url(href, "cekfakta.kompas.com"):
+                continue
+
 
             key = (title, href)
             if key in seen:

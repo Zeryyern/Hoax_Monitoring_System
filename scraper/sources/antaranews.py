@@ -3,6 +3,7 @@ import requests # type: ignore
 from bs4 import BeautifulSoup # type: ignore
 from datetime import datetime
 import time
+from scraper.utils import is_valid_article_url
 
 BASE_URL = "https://www.antaranews.com/slug/anti-hoax"
 HEADERS = {
@@ -36,6 +37,9 @@ def scrape_antaranews(pages=5):
 
             if href.startswith("/"):
                 href = "https://www.antaranews.com" + href
+            #after url normlization and before storing check if url is valid!
+            if not is_valid_article_url(href, "antaranews.com"):
+                continue
 
             key = (title, href)
             if key in seen:

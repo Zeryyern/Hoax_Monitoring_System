@@ -26,12 +26,14 @@ def init_db():
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS hoaxes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        source TEXT NOT NULL,
-        title TEXT NOT NULL,
-        url TEXT UNIQUE NOT NULL,
-        published_at TEXT,
-        fetched_at TEXT NOT NULL
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    title TEXT NOT NULL,
+    url TEXT UNIQUE NOT NULL,
+    published_at TEXT,
+    fetched_at TEXT NOT NULL,
+    content TEXT,
+    content_hash TEXT
     )
     """)
     #Runs tables

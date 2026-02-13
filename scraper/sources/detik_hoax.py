@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from urllib.parse import urljoin
 import time
 
+from scraper.utils import is_valid_article_url
+
 BASE_URL = "https://hoaxornot.detik.com/"
 
 HEADERS = {
@@ -47,7 +49,10 @@ def scrape_detik_hoax(pages=5):
 
             if len(title) < 25:
                 continue
-
+            #after url normalization and before storing check if url is valid!
+            if not is_valid_article_url(link, "hoaxornot.detik.com"):
+                continue
+            
             articles.append({
                 "source": "Detik Hoax or Not",
                 "title": title,
