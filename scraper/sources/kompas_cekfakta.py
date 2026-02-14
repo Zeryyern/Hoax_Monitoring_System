@@ -43,7 +43,8 @@ def scrape_kompas_cekfakta(pages=3):
                 href = "https://cekfakta.kompas.com" + href
                 
             #after url normalization and before storing check if url is valid!
-            if not is_valid_article_url(href, "cekfakta.kompas.com"):
+            # Allow kompas.com domain variants (www.kompas.com, cekfakta.kompas.com)
+            if not is_valid_article_url(href, "kompas.com"):
                 continue
 
 

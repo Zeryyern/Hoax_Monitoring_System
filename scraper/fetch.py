@@ -7,6 +7,7 @@ from scraper.sources.tempo_hoax import scrape_tempo_hoax
 from scraper.sources.kompas_cekfakta import scrape_kompas_cekfakta
 from scraper.sources.antaranews import scrape_antaranews
 from scraper.sources.turnbackhoax import scrape_turnbackhoax
+from logger import logger
 
 #health checker function
 def get_health_status(count):
@@ -22,7 +23,15 @@ def safe_run(scraper_func, source_name):
 
     try:
         data = scraper_func()
-        count = len(data)
+        if not data:
+            data = []
+
+        try:
+            count = len(data)
+        except TypeError:
+            logger.warning(f"{source_name} returned non-iterable data; coercing to empty list")
+            data = []
+            count = 0
 
         health = get_health_status(count)
 
@@ -33,9 +42,8 @@ def safe_run(scraper_func, source_name):
         return data
 
     except Exception as e:
-        print(f"[ERROR] {source_name} is DOWN ❌")
-        print(f"Reason: {e}")
-        traceback.print_exc()
+        logger.exception(f"[ERROR] {source_name} is DOWN ❌ Reason: {e}")
+        print(f"[ERROR] {source_name} is DOWN ❌ - see logs for details")
 
         log_source_run(source_name, "FAILURE", 0)
         return []

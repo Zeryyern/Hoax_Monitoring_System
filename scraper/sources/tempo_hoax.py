@@ -43,7 +43,8 @@ def scrape_tempo_hoax(pages=3):
                 href = "https://cekfakta.tempo.co" + href
 
             #after url normalization and before storing, check validity
-            if not is_valid_article_url(href, "cekfakta.tempo.co"):
+            # Accept tempo.co and its subdomains (en.tempo.co, cekfakta.tempo.co)
+            if not is_valid_article_url(href, "tempo.co"):
                 continue
             
             key = (title, href)

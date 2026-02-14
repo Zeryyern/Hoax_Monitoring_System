@@ -51,6 +51,10 @@ def scrape_turnbackhoax(pages=3):
             # 🔹 Filter invalid / non-article URLs
             if not is_valid_article_url(href, "turnbackhoax.id"):
                 continue
+            if "?" in href:
+                continue
+            if "/articles/" not in href:
+                continue
             key = (title, href)
             if key in seen:
                 continue

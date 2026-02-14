@@ -50,7 +50,8 @@ def scrape_detik_hoax(pages=5):
             if len(title) < 25:
                 continue
             #after url normalization and before storing check if url is valid!
-            if not is_valid_article_url(link, "hoaxornot.detik.com"):
+            # detik links often point to news.detik.com, sport.detik.com, etc. Accept detik.com
+            if not is_valid_article_url(link, "detik.com"):
                 continue
             
             articles.append({
