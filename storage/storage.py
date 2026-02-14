@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 from typing import List, Dict
 from logger import logger
-
+import json
 # Project root
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "data" / "hoax.db"
@@ -101,18 +101,30 @@ def get_articles_without_content(limit: int = 20):
     rows = cursor.fetchall()
     conn.close()
     return rows
-def update_article_content(article_id: int, content: str):
+import json
+
+def update_article_content(article_id: int,
+                           content: str,
+                           word_count: int,
+                           unique_word_count: int,
+                           keywords):
     conn = get_connection()
     cursor = conn.cursor()
 
+    keywords_json = json.dumps(keywords)
+
     cursor.execute("""
         UPDATE hoaxes
-        SET content = ?
+        SET content = ?,
+            word_count = ?,
+            unique_word_count = ?,
+            keywords = ?
         WHERE id = ?
-    """, (content, article_id))
+    """, (content, word_count, unique_word_count, keywords_json, article_id))
 
     conn.commit()
     conn.close()
+
 
 def log_run(total_collected: int, new_inserted: int, status: str):
     conn = get_connection()
@@ -250,3 +262,32 @@ def get_recent_runs(limit: int = 5):
     results = cursor.fetchall()
     conn.close()
     return results
+
+#nlp processing related queries
+def migrate_add_nlp_columns():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("PRAGMA table_info(hoaxes)")
+    columns = [col[1] for col in cursor.fetchall()]
+
+    if "word_count" not in columns:
+        cursor.execute("ALTER TABLE hoaxes ADD COLUMN word_count INTEGER")
+        logger.info("[MIGRATION] word_count column added")
+    else:
+        logger.info("[MIGRATION] word_count column already exists")
+
+    if "unique_word_count" not in columns:
+        cursor.execute("ALTER TABLE hoaxes ADD COLUMN unique_word_count INTEGER")
+        logger.info("[MIGRATION] unique_word_count column added")
+    else:
+        logger.info("[MIGRATION] unique_word_count column already exists")
+
+    if "keywords" not in columns:
+        cursor.execute("ALTER TABLE hoaxes ADD COLUMN keywords TEXT")
+        logger.info("[MIGRATION] keywords column added")
+    else:
+        logger.info("[MIGRATION] keywords column already exists")
+
+    conn.commit()
+    conn.close()

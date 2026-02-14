@@ -2,12 +2,14 @@ from storage.storage import (
     init_db,
     migrate_add_content_column,
     migrate_add_content_hash,
+    migrate_add_nlp_columns,
     save_articles,
     log_run,
     get_total_articles,
     get_articles_per_source,
     get_recent_runs
 )
+
 from processor.content_extractor import process_articles
 from scraper.fetch import fetch_all
 from logger import logger
@@ -21,7 +23,8 @@ def run_once():
         init_db()
         migrate_add_content_column()
         migrate_add_content_hash()
-
+        migrate_add_nlp_columns()
+        
         # Fetch data
         articles = fetch_all()
         total = len(articles)

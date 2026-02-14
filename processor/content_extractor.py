@@ -47,13 +47,18 @@ def process_articles(limit: int = 10):
             keywords = extract_keywords(tokens)
             
             word_count = len(tokens)
-            unique_words_count = len(set(tokens))
+            unique_word_count = len(set(tokens))
             print(f"[NLP] Word Count: {word_count}")
-            print(f"[NLP] Unique words: {unique_words_count}")
+            print(f"[NLP] Unique words: {unique_word_count}")
             print(f"[NLP] Keywords: {keywords[:5]}")
             
             #Save cleaned content to DB
-            update_article_content(article_id, cleaned_content)
+            update_article_content(article_id, 
+                                   cleaned_content,
+                                   word_count,
+                                   unique_word_count,
+                                    keywords
+                                )
             
             print(f"[SUCCESS] Content Saved with NLP Processing.")   
         else:
