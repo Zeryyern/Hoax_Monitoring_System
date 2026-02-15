@@ -7,7 +7,8 @@ from storage.storage import (
     log_run,
     get_total_articles,
     get_articles_per_source,
-    get_recent_runs
+    get_recent_runs,
+    get_top_keywords
 )
 
 from processor.content_extractor import process_articles
@@ -55,6 +56,11 @@ def run_once():
                 f"Status: {run['status']}"
             )
 
+        #analytics output
+        logger.info("TOP GLOBAL KEYWORDS")
+        for word, count in get_top_keywords(15):
+            logger.info(f"{word}: {count}")
+        
         # Process article contents
         logger.info("=== PROCESSING ARTICLE CONTENTS ===")
         process_articles(limit=5)

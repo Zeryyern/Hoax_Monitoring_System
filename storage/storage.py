@@ -1,10 +1,12 @@
-from builtins import str
+from builtins import Exception, str
 import sqlite3
 import hashlib
 from pathlib import Path
 from typing import List, Dict
 from logger import logger
 import json
+from collections import Counter
+
 # Project root
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "data" / "hoax.db"
@@ -54,11 +56,6 @@ def init_db():
         status TEXT NOT NULL,
         articles_collected INTEGER NOT NULL)
     """)
-    #cursor.execute("""
-     #   CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_content_hash 
-     #   ON hoaxes(content_hash)
-    #""")
-
     # Indexes for faster queries
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_source ON hoaxes(source)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_published_at ON hoaxes(published_at)")
@@ -291,3 +288,29 @@ def migrate_add_nlp_columns():
 
     conn.commit()
     conn.close()
+
+import json
+from collections import Counter
+
+def get_top_keywords(limit: int = 20):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT keywords FROM hoaxes
+        WHERE keywords IS NOT NULL
+    """)
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    counter = Counter()
+
+    for row in rows:
+        try:
+            keyword_list = json.loads(row["keywords"])
+            for word, count in keyword_list:
+                counter[word] += count
+        except Exception:
+            continue
+    return counter.most_common(limit)
