@@ -7,6 +7,8 @@ from storage.storage import (
 from analysis.text_cleaner import clean_text
 from analysis.nlp_processor import process_text
 from analysis.keyword_extractor import extract_keywords
+from analysis.classifier import classify_article
+
 def extract_main_text(url: str) -> str:
     try:
         response = requests.get(url, timeout=10, allow_redirects=True)
@@ -48,6 +50,8 @@ def process_articles(limit: int = 10):
             
             word_count = len(tokens)
             unique_word_count = len(set(tokens))
+            category = classify_article(cleaned_content)
+            print(f"[NLP] Category: {category}")
             print(f"[NLP] Word Count: {word_count}")
             print(f"[NLP] Unique words: {unique_word_count}")
             print(f"[NLP] Keywords: {keywords[:5]}")
@@ -57,7 +61,8 @@ def process_articles(limit: int = 10):
                                    cleaned_content,
                                    word_count,
                                    unique_word_count,
-                                    keywords
+                                    keywords,
+                                    category
                                 )
             
             print(f"[SUCCESS] Content Saved with NLP Processing.")   

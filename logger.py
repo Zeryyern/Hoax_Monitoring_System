@@ -1,3 +1,4 @@
+from builtins import hasattr
 import logging
 import os
 from datetime import datetime

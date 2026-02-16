@@ -104,7 +104,8 @@ def update_article_content(article_id: int,
                            content: str,
                            word_count: int,
                            unique_word_count: int,
-                           keywords):
+                           keywords,
+                           category: str ):
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -115,9 +116,10 @@ def update_article_content(article_id: int,
         SET content = ?,
             word_count = ?,
             unique_word_count = ?,
-            keywords = ?
+            keywords = ?,
+            category = ?
         WHERE id = ?
-    """, (content, word_count, unique_word_count, keywords_json, article_id))
+    """, (content, word_count, unique_word_count, keywords_json, category,article_id))
 
     conn.commit()
     conn.close()
@@ -289,8 +291,26 @@ def migrate_add_nlp_columns():
     conn.commit()
     conn.close()
 
-import json
-from collections import Counter
+
+def migrate_add_category_column():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("PRAGMA table_info(hoaxes)")
+    columns = [col[1] for col in cursor.fetchall()]
+
+    if "category" not in columns:
+        cursor.execute("""
+            ALTER TABLE hoaxes
+            ADD COLUMN category TEXT DEFAULT 'other'
+        """)
+        conn.commit()
+        logger.info("[MIGRATION] category column added")
+    else:
+        logger.info("[MIGRATION] category column already exists")
+
+    conn.close()
+
 
 def get_top_keywords(limit: int = 20):
     conn = get_connection()

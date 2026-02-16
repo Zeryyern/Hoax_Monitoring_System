@@ -3,6 +3,7 @@ from storage.storage import (
     migrate_add_content_column,
     migrate_add_content_hash,
     migrate_add_nlp_columns,
+    migrate_add_category_column,
     save_articles,
     log_run,
     get_total_articles,
@@ -25,7 +26,8 @@ def run_once():
         migrate_add_content_column()
         migrate_add_content_hash()
         migrate_add_nlp_columns()
-        
+        migrate_add_category_column()
+
         # Fetch data
         articles = fetch_all()
         total = len(articles)
