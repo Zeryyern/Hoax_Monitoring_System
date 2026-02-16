@@ -2,6 +2,8 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 import time
+from dateutil import parser as date_parser
+
 from scraper.utils import is_valid_article_url
 
 SOURCE_NAME = "TurnBackHoax"
@@ -14,6 +16,39 @@ HEADERS = {
     "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
     "Connection": "keep-alive"
 }
+
+
+def extract_published_date(article_url):
+    """Extract published date from article detail page"""
+    try:
+        response = requests.get(article_url, headers=HEADERS, timeout=10)
+        if response.status_code != 200:
+            return None
+        
+        soup = BeautifulSoup(response.text, "html.parser")
+        
+        # Try multiple common date selectors
+        date_elem = None
+        for selector in ['time', '[property="article:published_time"]', '.publish-date', '.article-date', 'span.date', '.posted-on']:
+            date_elem = soup.select_one(selector)
+            if date_elem:
+                break
+        
+        if not date_elem:
+            return None
+        
+        # Check for datetime attribute first
+        date_str = date_elem.get('datetime') or date_elem.get('content') or date_elem.get_text(strip=True)
+        
+        if not date_str:
+            return None
+        
+        # Parse the date
+        parsed_date = date_parser.parse(date_str)
+        return parsed_date.isoformat()
+    except Exception as e:
+        print(f"Error extracting date from {article_url}: {e}")
+        return None
 
 
 def scrape_turnbackhoax(pages=3):
@@ -59,11 +94,15 @@ def scrape_turnbackhoax(pages=3):
             if key in seen:
                 continue
             seen.add(key)
+            
+            # Extract published date
+            published_date = extract_published_date(href)
 
             articles.append({
                 "source": SOURCE_NAME,
                 "title": title,
                 "url": href,
+                "published_at": published_date,
                 "scraped_at": datetime.now(timezone.utc).isoformat()
             })
 

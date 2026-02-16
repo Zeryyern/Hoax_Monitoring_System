@@ -1,6 +1,7 @@
 import logging
 import os
 from datetime import datetime
+import sys
 
 # Ensure logs directory exists
 LOG_DIR = "logs"
@@ -17,14 +18,18 @@ logger.setLevel(logging.DEBUG)  # Capture all levels
 if not logger.handlers:
 
     # File handler (stores logs in file)
-    file_handler = logging.FileHandler(log_filename)
+    file_handler = logging.FileHandler(log_filename, encoding='utf-8')
     file_handler.setLevel(logging.INFO)
 
-    # Console handler (prints to terminal)
-    console_handler = logging.StreamHandler()
+    # Console handler with encoding fix for Windows
+    console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
+    
+    # Force UTF-8 encoding for console on Windows
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
 
-    # Log format
+    # Log format without emojis for Windows compatibility
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"

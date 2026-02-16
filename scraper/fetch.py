@@ -1,5 +1,5 @@
 from builtins import Exception, len, print, set
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import traceback
 from storage.storage import log_source_run
 from scraper.sources.detik_hoax import scrape_detik_hoax
@@ -8,14 +8,15 @@ from scraper.sources.kompas_cekfakta import scrape_kompas_cekfakta
 from scraper.sources.antaranews import scrape_antaranews
 from scraper.sources.turnbackhoax import scrape_turnbackhoax
 from logger import logger
+import requests
 
-#health checker function
+# health checker function
 def get_health_status(count):
     if count == 0:
-        return "DOWN ❌"
+        return "DOWN [FAIL]"
     elif count < 5:
-        return "DEGRADED ⚠️"
-    return "HEALTHY ✅"
+        return "DEGRADED [WARN]"
+    return "HEALTHY [OK]"
 
 
 def safe_run(scraper_func, source_name):
@@ -35,16 +36,27 @@ def safe_run(scraper_func, source_name):
 
         health = get_health_status(count)
 
-        print(f"[SUCCESS] {source_name} → {count} raw articles")
+        print(f"[SUCCESS] {source_name} -> {count} raw articles")
         print(f"[HEALTH] {source_name}: {health}")
 
         log_source_run(source_name, "SUCCESS", count)
         return data
 
-    except Exception as e:
-        logger.exception(f"[ERROR] {source_name} is DOWN ❌ Reason: {e}")
-        print(f"[ERROR] {source_name} is DOWN ❌ - see logs for details")
+    except requests.exceptions.ConnectTimeout as e:
+        logger.warning(f"[TIMEOUT] {source_name}: Connection timeout. Will retry next run.")
+        print(f"[TIMEOUT] {source_name}: Connection timeout - skipping")
+        log_source_run(source_name, "TIMEOUT", 0)
+        return []
+    
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"[NETWORK ERROR] {source_name}: {type(e).__name__}")
+        print(f"[ERROR] {source_name}: Network error - {type(e).__name__}")
+        log_source_run(source_name, "NETWORK_ERROR", 0)
+        return []
 
+    except Exception as e:
+        logger.exception(f"[ERROR] {source_name} is DOWN [FAIL] Reason: {e}")
+        print(f"[ERROR] {source_name} is DOWN [FAIL] - see logs for details")
         log_source_run(source_name, "FAILURE", 0)
         return []
 
@@ -64,11 +76,11 @@ def normalize_and_filter(items, source_name):
             continue
 
         valid.append({
-            "source": source_name,
+            "source": item.get("source", source_name),
             "title": item.get("title", "").strip(),
             "url": url.strip(),
-            "date": item.get("date", ""),
-            "fetched_at": datetime.utcnow().isoformat()
+            "published_at": item.get("published_at"),
+            "fetched_at": datetime.now(timezone.utc).isoformat()
         })
 
     if dropped:
@@ -91,6 +103,7 @@ def deduplicate(items):
 
 
 def fetch_all():
+    """Fetch articles from all sources with graceful error handling"""
     all_items = []
 
     sources = [

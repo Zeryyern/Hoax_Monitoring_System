@@ -186,11 +186,11 @@ def save_articles(articles: List[Dict]) -> int:
             # Generate stable content identity
             source = item.get("source", "").strip()
             title = item.get("title", "").strip()
-            date = item.get("date")
+            published_at = item.get("published_at")
             if not source or not title:
                 logger.warning("Skipped article with missing source/title")
                 continue
-            content_hash = generate_content_hash(source, title, date)
+            content_hash = generate_content_hash(source, title, published_at)
 
 
             cursor.execute("""
@@ -201,7 +201,7 @@ def save_articles(articles: List[Dict]) -> int:
                 item.get("source"),
                 item.get("title"),
                 item.get("url"),
-                item.get("date"),
+                item.get("published_at"),
                 item.get("fetched_at"),
                 content_hash
             ))
