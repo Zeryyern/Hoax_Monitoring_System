@@ -1,27 +1,39 @@
+from collections import Counter
+
 def classify_article(text: str) -> str:
     """
-    Simple rule-based category classifier.
-    Returns one category label as string.
+    Improved rule-based classifier for Indonesian news articles.
+    Uses token-based scoring to avoid substring bias.
     """
 
     text = text.lower()
+    tokens = text.split()
+    token_counts = Counter(tokens)
 
     categories = {
         "politics": [
-            "government", "president", "election", "minister",
-            "parliament", "policy", "vote", "law"
+            "jokowi", "presiden", "menteri", "dpr", "uu",
+            "pemerintah", "pemilu", "politik", "partai", "kpk"
         ],
         "health": [
-            "virus", "covid", "vaccine", "hospital",
-            "doctor", "health", "disease", "medical"
+            "virus", "covid", "vaksin", "rumah", "sakit",
+            "dokter", "kesehatan", "pasien", "penyakit"
         ],
         "technology": [
-            "ai", "technology", "software", "cyber",
-            "internet", "application", "digital", "data"
+            "ai", "teknologi", "aplikasi", "internet",
+            "digital", "data", "cyber", "software"
         ],
         "economy": [
-            "economy", "market", "bank", "finance",
-            "money", "investment", "stock", "inflation"
+            "ekonomi", "pasar", "bank", "keuangan",
+            "uang", "investasi", "saham", "inflasi", "msci"
+        ],
+        "sports": [
+            "ronaldo", "messi", "maradona",
+            "sepakbola", "bola", "liga", "gol"
+        ],
+        "law": [
+            "hukum", "penganiayaan", "tersangka",
+            "kasus", "polisi", "penjara", "sidang"
         ]
     }
 
@@ -29,14 +41,15 @@ def classify_article(text: str) -> str:
 
     for category, keywords in categories.items():
         for word in keywords:
-            if word in text:
-                scores[category] += 1
+            scores[category] += token_counts.get(word, 0)
 
-    # Get category with highest score
+    # Debug optional:
+    # print("SCORES:", scores)
+
     best_category = max(scores, key=scores.get)
 
-    # If no keywords matched
+    # If all scores are zero → fallback
     if scores[best_category] == 0:
-        return "general"
+        return "other"
 
     return best_category
