@@ -334,3 +334,44 @@ def get_top_keywords(limit: int = 20):
         except Exception:
             continue
     return counter.most_common(limit)
+
+def get_articles_per_category():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT category, COUNT(*) 
+        FROM hoaxes
+        GROUP BY category
+        ORDER BY COUNT(*) DESC
+    """)
+
+    results = cursor.fetchall()
+    conn.close()
+
+    return results
+
+
+def get_recent_articles(limit: int = 10):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT title, source, published_at, category
+        FROM hoaxes
+        ORDER BY published_at DESC
+        LIMIT ?
+    """, (limit,))
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [
+        {
+            "title": row["title"],
+            "source": row["source"],
+            "published_at": row["published_at"],
+            "category": row["category"]
+        }
+        for row in rows
+    ]
