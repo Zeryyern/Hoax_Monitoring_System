@@ -5,6 +5,10 @@ from datetime import datetime, timezone
 import time
 from dateutil import parser as date_parser
 from requests.exceptions import RequestException, Timeout, ConnectionError
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+# Suppress SSL warnings when verify=False is used
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 from scraper.utils import is_valid_article_url
 
@@ -14,13 +18,16 @@ HEADERS = {
 }
 
 
-def extract_published_date(article_url, timeout=8):
+def extract_published_date(article_url, timeout=8, session=None):
     """
     Extract published date from article detail page
     Returns None if extraction fails or times out
     """
     try:
-        response = requests.get(article_url, headers=HEADERS, timeout=timeout)
+        if session is None:
+            session = requests.Session()
+            session.verify = False
+        response = session.get(article_url, timeout=timeout)
         if response.status_code != 200:
             return None
         
@@ -55,13 +62,16 @@ def extract_published_date(article_url, timeout=8):
 
 
 def scrape_antaranews(pages=5):
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    session.verify = False
     results = []
     seen = set()
 
     for page in range(1, pages + 1):
         try:
             url = f"{BASE_URL}?page={page}"
-            r = requests.get(url, headers=HEADERS, timeout=20)
+            r = session.get(url, timeout=20)
             print(f"STATUS page {page}: {r.status_code}")
 
             if r.status_code != 200:
@@ -96,7 +106,7 @@ def scrape_antaranews(pages=5):
                 seen.add(key)
                 
                 # Extract published date (silently fails if timeout/error)
-                published_date = extract_published_date(href)
+                published_date = extract_published_date(href, session=session)
 
                 results.append({
                     "source": "Antara Anti-Hoax",

@@ -5,6 +5,10 @@ from datetime import datetime, timezone
 from urllib.parse import urljoin
 import time
 from dateutil import parser as date_parser
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+# Suppress SSL warnings when verify=False is used
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 from scraper.utils import is_valid_article_url
 
@@ -16,10 +20,13 @@ HEADERS = {
 }
 
 
-def extract_published_date(article_url):
+def extract_published_date(article_url, session=None):
     """Extract published date from article detail page"""
     try:
-        r = requests.get(article_url, headers=HEADERS, timeout=10)
+        if session is None:
+            session = requests.Session()
+            session.verify = False
+        r = session.get(article_url, timeout=10)
         if r.status_code != 200:
             return None
         
@@ -63,11 +70,14 @@ def deduplicate_by_url(items):
 
 
 def scrape_detik_hoax(pages=5):
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    session.verify = False
     articles = []
 
     for page in range(1, pages + 1):
         url = BASE_URL if page == 1 else f"{BASE_URL}?page={page}"
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = session.get(url, timeout=20)
 
         print(f"STATUS page {page}: {r.status_code}")
 
@@ -92,7 +102,7 @@ def scrape_detik_hoax(pages=5):
                 continue
             
             # Extract published date
-            published_date = extract_published_date(link)
+            published_date = extract_published_date(link, session)
             
             articles.append({
                 "source": "Detik Hoax or Not",
