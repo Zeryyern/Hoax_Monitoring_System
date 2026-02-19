@@ -99,43 +99,141 @@ def tokenize(text: str) -> List[str]:
 # CLASSIFIER
 # ---------------------------------------------------------
 
-def classify_article(text: str) -> str:
-    """
-    Professional rule-based news classifier.
+# ---------------------------------------------------------
+# HOAX DETECTION PATTERNS
+# ---------------------------------------------------------
 
-    Strategy:
-    - Tokenize and normalize text
-    - Count keyword frequency
-    - Apply category weights
-    - Select highest scoring category
-    - Apply threshold filtering
-    - Resolve ties deterministically
-    """
+HOAX_INDICATORS = {
+    "sensationalist_language": [
+        "shocking", "unbelievable", "incredible", "outrageous",
+        "URGENT", "ALERT", "BREAKING", "guncangan", "guncang",
+        "mengejutkan", "tidak percaya", "luar biasa", "mengerikan"
+    ],
+    "conspiracy_markers": [
+        "conspir", "cover-up", "hidden", "secret government",
+        "big pharma", "illuminati", "deep state", "shadow",
+        "konspirasi", "tutup-tutupi", "rahasia", "pemerintah tersembunyi"
+    ],
+    "unverified_claims": [
+        "allegedly", "rumor", "supposedly", "claimed",
+        "diberitakan", "dituduhkan", "konon", "katanya"
+    ],
+    "misinformation_markers": [
+        "fake", "hoax", "false", "misleading",
+        "palsu", "bohong", "menyesatkan", "tidak benar"
+    ]
+}
 
+LEGITIMACY_INDICATORS = {
+    "credible_sources": [
+        "reuters", "bbc", "cnn", "ap news", "associated press",
+        "badan pers", "kementerian", "resmi", "official",
+        "pernyataan resmi", "sumber terpercaya", "menurut pakar"
+    ],
+    "verifiable_language": [
+        "confirmed", "verified", "according", "evidence",
+        "data", "study", "research", "findings",
+        "terkonfirmasi", "terbukti", "menurut", "bukti", "data"
+    ],
+    "date_specific": [
+        "today", "yesterday", "yesterday's", "specific dates",
+        "hari ini", "kemarin", "tanggal"
+    ]
+}
+
+
+def detect_hoax_signal(text: str) -> tuple:
+    """
+    Detect hoax indicators in text.
+    Returns (hoax_score, legitimacy_score, hoax_count, legit_count)
+    hoax_score and legitimacy_score are between 0 and 1
+    """
+    tokens = tokenize(text)
+    text_lower = text.lower()
+    
+    hoax_count = 0
+    legit_count = 0
+    
+    # Count hoax indicators
+    for category, keywords in HOAX_INDICATORS.items():
+        for keyword in keywords:
+            hoax_count += text_lower.count(keyword.lower())
+    
+    # Count legitimacy indicators
+    for category, keywords in LEGITIMACY_INDICATORS.items():
+        for keyword in keywords:
+            legit_count += text_lower.count(keyword.lower())
+    
+    # Calculate scores (normalized)
+    total_words = len(tokens)
+    if total_words == 0:
+        return 0.5, 0.5, hoax_count, legit_count
+    
+    # Normalize scores
+    hoax_score = min(hoax_count / max(1, total_words / 10), 1.0)
+    legit_score = min(legit_count / max(1, total_words / 10), 1.0)
+    
+    return hoax_score, legit_score, hoax_count, legit_count
+
+
+def classify_article(text: str) -> tuple:
+    """
+    Enhanced classifier with confidence scoring.
+    
+    Returns: (prediction, confidence)
+    - prediction: 'Hoax' or 'Legitimate'
+    - confidence: float between 0.0 and 1.0
+    """
+    if not text or len(text.strip()) < 20:
+        return 'Legitimate', 0.3  # Too short to classify confidently
+    
+    hoax_score, legit_score, hoax_count, legit_count = detect_hoax_signal(text)
+    
+    # Calculate category-based score
     tokens = tokenize(text)
     token_counts = Counter(tokens)
-
-    scores: Dict[str, int] = {}
-
+    
+    category_scores: Dict[str, int] = {}
     for category, config in CATEGORIES.items():
         raw_score = sum(token_counts.get(word, 0) for word in config["keywords"])
         weighted_score = raw_score * config["weight"]
-        scores[category] = weighted_score
-
-    # Sort categories by score (descending)
-    sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
-    best_category, best_score = sorted_scores[0]
-
-    # If below threshold → classify as other
-    if best_score < MIN_SCORE_THRESHOLD:
-        return "other"
-
-    # Handle tie cases (rare but important)
-    top_categories = [cat for cat, score in sorted_scores if score == best_score]
-
-    if len(top_categories) > 1:
-        # deterministic tie breaker: alphabetical order
-        return sorted(top_categories)[0]
-
-    return best_category
+        category_scores[category] = weighted_score
+    
+    # Get top category
+    if category_scores:
+        best_category = max(category_scores, key=category_scores.get)
+        category_weight = category_scores[best_category] / max(1, sum(category_scores.values()))
+    else:
+        best_category = 'other'
+        category_weight = 0.0
+    
+    # Combine signals for final decision
+    # 60% hoax/legit signals, 20% category detection, 20% keyword balance
+    hoax_signal_weight = 0.6
+    category_weight_multiplier = 0.2
+    balance_weight = 0.2
+    
+    # Calculate balance (favor legit sources)
+    legit_advantage = legit_score - hoax_score
+    balance_score = (legit_advantage + 1) / 2  # Normalize to 0-1
+    
+    final_hoax_score = (
+        hoax_score * hoax_signal_weight +
+        (0.7 if best_category in ['politics', 'disaster'] else 0.3) * category_weight_multiplier +
+        (1 - balance_score) * balance_weight
+    )
+    
+    # Determine prediction
+    if final_hoax_score > 0.5:
+        prediction = 'Hoax'
+        confidence = min(final_hoax_score, 0.99)
+    else:
+        prediction = 'Legitimate'
+        confidence = min(1 - final_hoax_score, 0.99)
+    
+    # Confidence floor: if signals are weak, lower confidence
+    total_signals = hoax_count + legit_count
+    if total_signals < 2:
+        confidence = max(0.4, confidence * 0.6)
+    
+    return prediction, round(confidence, 3)
