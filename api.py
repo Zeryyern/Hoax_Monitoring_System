@@ -10,6 +10,8 @@ from auth import (
     create_token, log_admin_action as record_admin_action, hash_password, verify_password
 )
 from datetime import datetime, timedelta
+import smtplib
+from email.message import EmailMessage
 from config import (
     CORS_ORIGINS,
     API_ENV,
@@ -20,6 +22,12 @@ from config import (
     SUPER_ADMIN_EMAIL,
     BOOTSTRAP_ADMIN_ENABLED,
     BOOTSTRAP_ADMIN_TOKEN,
+    SMTP_HOST,
+    SMTP_PORT,
+    SMTP_USERNAME,
+    SMTP_PASSWORD,
+    SMTP_USE_TLS,
+    EMAIL_FROM,
 )
 import json
 import traceback
@@ -199,6 +207,37 @@ def _record_login_failure(email: str):
 
 def _clear_login_failures(email: str):
     LOGIN_ATTEMPTS.pop(_login_attempt_key(email), None)
+
+
+def _admin_unique_id_for(user_id: int) -> str:
+    return f"ADM-{user_id}"
+
+
+def _validate_admin_unique_id(value: str, user_id: int) -> bool:
+    provided = (value or "").strip()
+    if not provided:
+        return False
+    return provided in {str(user_id), _admin_unique_id_for(user_id)}
+
+
+def _send_email(to_email: str, subject: str, body: str) -> tuple[bool, str | None]:
+    if not SMTP_HOST or not SMTP_USERNAME or not SMTP_PASSWORD or not EMAIL_FROM:
+        return False, "SMTP is not configured"
+    try:
+        msg = EmailMessage()
+        msg["From"] = EMAIL_FROM
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.set_content(body)
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            if SMTP_USE_TLS:
+                server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 # ===============================
 # SCRAPING CONTROL
@@ -534,7 +573,8 @@ def api_info():
             "analyze": ["/api/analyze"],
             "admin": ["/api/admin/dashboard", "/api/admin/users"],
             "user": ["/api/user/profile", "/api/user/analysis"],
-            "bootstrap": ["/api/auth/bootstrap-super-admin"]
+            "bootstrap": ["/api/auth/bootstrap-super-admin"],
+            "support": ["/api/password-reset-tickets", "/api/admin/password-reset-tickets"]
         }
     })
 
@@ -1328,6 +1368,77 @@ def admin_change_user_role(user_id):
     except Exception as e:
         return error_response(str(e), 500)
 
+
+@app.route("/api/password-reset-tickets", methods=["POST"])
+def create_password_reset_ticket():
+    """Public endpoint for submitting password reset support tickets."""
+    try:
+        data = request.get_json() or {}
+        full_name = (data.get("full_name") or "").strip()
+        email = (data.get("email") or "").strip().lower()
+        message = (data.get("message") or "").strip()
+        ticket_type = (data.get("ticket_type") or "user").strip().lower()
+        admin_unique_id = (data.get("admin_unique_id") or "").strip()
+
+        if len(full_name) < 3:
+            return error_response("Full name must be at least 3 characters", 400)
+        if "@" not in email:
+            return error_response("Invalid email format", 400)
+        if len(message) > 1000:
+            return error_response("Message must be 1000 characters or fewer", 400)
+        if ticket_type not in {"user", "admin"}:
+            return error_response("Invalid ticket type", 400)
+        if ticket_type == "admin":
+            if not admin_unique_id:
+                return error_response("Admin unique ID is required for admin requests", 400)
+            # Admin requests must match an existing admin account by email and unique ID.
+            admin_user = get_user_by_email(email)
+            if not admin_user or admin_user.get("role") != "admin":
+                return error_response("Admin account not found for this email", 403)
+            if not _validate_admin_unique_id(admin_unique_id, int(admin_user["id"])):
+                return error_response("Invalid admin unique ID", 403)
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        # Prevent duplicate open tickets for same email.
+        cursor.execute(
+            """
+            SELECT id
+            FROM password_reset_tickets
+            WHERE email = ? AND ticket_type = ? AND status = 'open'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (email, ticket_type),
+        )
+        existing = cursor.fetchone()
+        if existing:
+            conn.close()
+            return error_response(
+                "An open reset ticket already exists for this email. Please wait for admin response.",
+                409,
+            )
+
+        cursor.execute(
+            """
+            INSERT INTO password_reset_tickets (full_name, email, message, ticket_type, admin_unique_id, status)
+            VALUES (?, ?, ?, ?, ?, 'open')
+            """,
+            (full_name, email, message or None, ticket_type, admin_unique_id or None),
+        )
+        ticket_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+
+        return success_response(
+            {"ticket_id": ticket_id, "status": "open", "ticket_type": ticket_type},
+            "Password reset request submitted successfully",
+            201,
+        )
+    except Exception as e:
+        return error_response(str(e), 500, traceback.format_exc())
+
 @app.route("/api/admin/users/<int:user_id>", methods=["DELETE"])
 @admin_required
 def admin_delete_user(user_id):
@@ -1604,6 +1715,225 @@ def get_admin_logs():
             "total_pages": (total + limit - 1) // limit
         })
         
+    except Exception as e:
+        return error_response(str(e), 500, traceback.format_exc())
+
+
+@app.route("/api/admin/password-reset-tickets", methods=["GET"])
+@admin_required
+def admin_get_password_reset_tickets():
+    """Get password reset support tickets (admin only)."""
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+        limit = min(100, int(request.args.get("limit", 20)))
+        status = (request.args.get("status", "all") or "all").strip().lower()
+        offset = (page - 1) * limit
+
+        if status not in {"all", "open", "resolved"}:
+            return error_response("Invalid status filter", 400)
+
+        where_sql = ""
+        params: list = []
+        if status in {"open", "resolved"}:
+            where_sql = "WHERE t.status = ?"
+            params.append(status)
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(f"SELECT COUNT(*) as count FROM password_reset_tickets t {where_sql}", tuple(params))
+        total = cursor.fetchone()["count"]
+
+        query_params = [*params, limit, offset]
+        cursor.execute(
+            f"""
+            SELECT
+                t.id, t.full_name, t.email, t.message, t.ticket_type, t.admin_unique_id,
+                t.status, t.created_at,
+                t.resolved_at, t.resolution_note, t.resolved_by,
+                u.username as resolved_by_username,
+                ureq.id as matched_user_id,
+                ureq.username as matched_username
+            FROM password_reset_tickets t
+            LEFT JOIN users u ON u.id = t.resolved_by
+            LEFT JOIN users ureq ON lower(ureq.email) = lower(t.email)
+            {where_sql}
+            ORDER BY
+                CASE WHEN t.status = 'open' THEN 0 ELSE 1 END,
+                t.created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(query_params),
+        )
+        tickets = list_from_rows(cursor.fetchall())
+        conn.close()
+
+        return success_response(
+            {
+                "items": tickets,
+                "pagination": {
+                    "page": page,
+                    "limit": limit,
+                    "total": total,
+                    "pages": (total + limit - 1) // limit,
+                },
+            }
+        )
+    except Exception as e:
+        return error_response(str(e), 500, traceback.format_exc())
+
+
+@app.route("/api/admin/password-reset-tickets/<int:ticket_id>/resolve", methods=["PUT"])
+@admin_required
+def admin_resolve_password_reset_ticket(ticket_id: int):
+    """Resolve a password reset support ticket (admin only)."""
+    try:
+        data = request.get_json() or {}
+        resolution_note = (data.get("resolution_note") or "").strip()
+        admin_unique_id = (data.get("admin_unique_id") or "").strip()
+        reset_username = (data.get("reset_username") or "").strip()
+        reset_password = (data.get("reset_password") or "").strip()
+
+        if not _validate_admin_unique_id(admin_unique_id, int(request.current_user["user_id"])):
+            return error_response("Invalid admin unique ID confirmation", 403)
+        if len(resolution_note) > 1000:
+            return error_response("Resolution note must be 1000 characters or fewer", 400)
+        if bool(reset_username) != bool(reset_password):
+            return error_response("Both reset username and reset password must be provided together", 400)
+        if reset_password and len(reset_password) < 8:
+            return error_response("Reset password must be at least 8 characters", 400)
+        if reset_username and len(reset_username) < 3:
+            return error_response("Reset username must be at least 3 characters", 400)
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT id, status, email, full_name, ticket_type FROM password_reset_tickets WHERE id = ?",
+            (ticket_id,),
+        )
+        ticket = cursor.fetchone()
+        if not ticket:
+            conn.close()
+            return error_response("Ticket not found", 404)
+
+        if ticket["status"] == "resolved":
+            conn.close()
+            return error_response("Ticket is already resolved", 400)
+
+        credentials_reset = False
+        target_username = None
+        if reset_username and reset_password:
+            target_user = get_user_by_email(ticket["email"])
+            if not target_user:
+                conn.close()
+                return error_response("No existing user account found for this ticket email", 404)
+
+            cursor.execute(
+                """
+                UPDATE users
+                SET username = ?, password_hash = ?, is_active = 1
+                WHERE id = ?
+                """,
+                (reset_username, hash_password(reset_password), target_user["id"]),
+            )
+            credentials_reset = True
+            target_username = reset_username
+
+        cursor.execute(
+            """
+            UPDATE password_reset_tickets
+            SET status = 'resolved',
+                resolved_at = CURRENT_TIMESTAMP,
+                resolved_by = ?,
+                resolution_note = ?
+            WHERE id = ?
+            """,
+            (request.current_user["user_id"], resolution_note or None, ticket_id),
+        )
+        conn.commit()
+        conn.close()
+
+        subject = "Hoax Monitoring System - Password Reset Ticket Resolved"
+        email_body = (
+            f"Hello {ticket['full_name']},\n\n"
+            f"Your password reset ticket #{ticket_id} has been resolved by administrator {request.current_user['username']}.\n"
+        )
+        if credentials_reset:
+            email_body += (
+                "\nYour account credentials have been reset by admin:\n"
+                f"- Username: {target_username}\n"
+                f"- Temporary Password: {reset_password}\n"
+                "Please sign in and change your password immediately.\n"
+            )
+        if resolution_note:
+            email_body += f"\nAdmin note: {resolution_note}\n"
+        email_body += "\nRegards,\nHoax Monitoring Support\n"
+
+        notification_sent, notification_error = _send_email(ticket["email"], subject, email_body)
+
+        record_admin_action(
+            request.current_user["user_id"],
+            "RESOLVE_PASSWORD_RESET_TICKET",
+            (
+                f"Resolved reset ticket #{ticket_id} for {ticket['email']} ({ticket['full_name']})"
+                f"; credentials_reset={credentials_reset}"
+            ),
+        )
+
+        return success_response(
+            {
+                "ticket_id": ticket_id,
+                "status": "resolved",
+                "credentials_reset": credentials_reset,
+                "notification_sent": notification_sent,
+                "notification_error": notification_error,
+            },
+            "Ticket resolved successfully",
+        )
+    except Exception as e:
+        return error_response(str(e), 500, traceback.format_exc())
+
+
+@app.route("/api/admin/password-reset-tickets/<int:ticket_id>", methods=["DELETE"])
+@admin_required
+def admin_delete_password_reset_ticket(ticket_id: int):
+    """Delete a password reset ticket (admin only, with admin ID confirmation)."""
+    try:
+        data = request.get_json() or {}
+        admin_unique_id = (data.get("admin_unique_id") or "").strip()
+        delete_reason = (data.get("delete_reason") or "").strip()
+
+        if not _validate_admin_unique_id(admin_unique_id, int(request.current_user["user_id"])):
+            return error_response("Invalid admin unique ID confirmation", 403)
+        if len(delete_reason) > 1000:
+            return error_response("Delete reason must be 1000 characters or fewer", 400)
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, email, full_name, status FROM password_reset_tickets WHERE id = ?",
+            (ticket_id,),
+        )
+        ticket = cursor.fetchone()
+        if not ticket:
+            conn.close()
+            return error_response("Ticket not found", 404)
+
+        cursor.execute("DELETE FROM password_reset_tickets WHERE id = ?", (ticket_id,))
+        conn.commit()
+        conn.close()
+
+        record_admin_action(
+            request.current_user["user_id"],
+            "DELETE_PASSWORD_RESET_TICKET",
+            (
+                f"Deleted reset ticket #{ticket_id} for {ticket['email']} ({ticket['full_name']}); "
+                f"previous_status={ticket['status']}; reason={delete_reason or 'n/a'}"
+            ),
+        )
+
+        return success_response({"ticket_id": ticket_id, "deleted": True}, "Ticket deleted successfully")
     except Exception as e:
         return error_response(str(e), 500, traceback.format_exc())
 

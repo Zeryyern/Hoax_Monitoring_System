@@ -85,6 +85,38 @@ def init_db():
         )
     """)
 
+    # ===============================
+    # PASSWORD RESET TICKETS
+    # ===============================
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS password_reset_tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            full_name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            message TEXT,
+            ticket_type TEXT DEFAULT 'user' CHECK(ticket_type IN ('user', 'admin')),
+            admin_unique_id TEXT,
+            status TEXT DEFAULT 'open' CHECK(status IN ('open', 'resolved')),
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            resolved_at TEXT,
+            resolved_by INTEGER,
+            resolution_note TEXT,
+            FOREIGN KEY (resolved_by) REFERENCES users(id) ON DELETE SET NULL
+        )
+    """)
+
+    # Add missing columns for existing databases.
+    cursor.execute("PRAGMA table_info(password_reset_tickets)")
+    ticket_columns = {row[1] for row in cursor.fetchall()}
+    if "ticket_type" not in ticket_columns:
+        cursor.execute(
+            "ALTER TABLE password_reset_tickets ADD COLUMN ticket_type TEXT DEFAULT 'user' CHECK(ticket_type IN ('user', 'admin'))"
+        )
+    if "admin_unique_id" not in ticket_columns:
+        cursor.execute(
+            "ALTER TABLE password_reset_tickets ADD COLUMN admin_unique_id TEXT"
+        )
+
     # Create indices for better performance
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_news_date ON news(date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_news_category ON news(category)")
@@ -93,6 +125,10 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_analysis_news ON user_analysis(news_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_admin_logs_admin ON admin_logs(admin_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reset_tickets_status ON password_reset_tickets(status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reset_tickets_email ON password_reset_tickets(email)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reset_tickets_created_at ON password_reset_tickets(created_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reset_tickets_type ON password_reset_tickets(ticket_type)")
 
     conn.commit()
     conn.close()

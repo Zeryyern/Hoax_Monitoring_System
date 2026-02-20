@@ -2,12 +2,35 @@
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+def _load_env_fallback(env_path: str):
+    """Minimal .env loader fallback when python-dotenv is unavailable."""
+    if not os.path.exists(env_path):
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if value and ((value[0] == value[-1]) and value.startswith(("'", '"'))):
+                    value = value[1:-1]
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except Exception:
+        # Keep non-fatal behavior
+        pass
+
+
 # Load .env if available (non-fatal if missing)
+_env_path = os.path.join(BASE_DIR, '.env')
 try:
     from dotenv import load_dotenv
-    load_dotenv(os.path.join(BASE_DIR, '.env'))
+    load_dotenv(_env_path)
 except Exception:
-    pass
+    _load_env_fallback(_env_path)
 
 # ===============================
 # DATABASE CONFIGURATION
@@ -86,6 +109,17 @@ API_PORT = int(os.getenv('API_PORT', '5000'))
 if API_ENV == 'production':
     if not CORS_ORIGINS or CORS_ORIGINS.strip() == '*':
         raise RuntimeError("CORS_ORIGINS must be a non-wildcard value in production")
+
+# ===============================
+# EMAIL/NOTIFICATION SETTINGS
+# ===============================
+
+SMTP_HOST = os.getenv('SMTP_HOST', '').strip()
+SMTP_PORT = int(os.getenv('SMTP_PORT', '587'))
+SMTP_USERNAME = os.getenv('SMTP_USERNAME', '').strip()
+SMTP_PASSWORD = os.getenv('SMTP_PASSWORD', '').strip()
+SMTP_USE_TLS = os.getenv('SMTP_USE_TLS', 'true').lower() == 'true'
+EMAIL_FROM = os.getenv('EMAIL_FROM', SMTP_USERNAME).strip()
 
 # ===============================
 # ML/NLP SETTINGS
