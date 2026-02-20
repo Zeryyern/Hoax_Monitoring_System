@@ -1,11 +1,15 @@
 ﻿import argparse
 
-from config import API_HOST, API_PORT, DEBUG
+from config import API_HOST, API_PORT, DEBUG, API_ENV
 
 
 def run_api_server():
     from api import app
 
+    if API_ENV.lower() == "production":
+        from waitress import serve
+        serve(app, host=API_HOST, port=API_PORT)
+        return
     app.run(debug=DEBUG, host=API_HOST, port=API_PORT, use_reloader=False)
 
 

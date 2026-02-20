@@ -1,5 +1,4 @@
 ﻿import os
-import secrets
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -22,9 +21,26 @@ DATA_DIR = os.path.dirname(DB_PATH)
 # SECURITY CONFIGURATION
 # ===============================
 
-SECRET_KEY = os.getenv('SECRET_KEY', secrets.token_urlsafe(32))
+# Environment mode
+API_ENV = os.getenv('API_ENV', 'development').strip().lower()
+
+# Production must always provide SECRET_KEY explicitly.
+_raw_secret_key = os.getenv('SECRET_KEY', '').strip()
+if _raw_secret_key:
+    SECRET_KEY = _raw_secret_key
+elif API_ENV == 'production':
+    raise RuntimeError("SECRET_KEY is required when API_ENV=production")
+else:
+    SECRET_KEY = 'dev-insecure-secret-change-me'
 TOKEN_EXPIRY_HOURS = int(os.getenv('TOKEN_EXPIRY_HOURS', '24'))
-CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*')
+CORS_ORIGINS = os.getenv('CORS_ORIGINS', '')
+
+# Super admin (immutable overseer account)
+SUPER_ADMIN_USERNAME = os.getenv('SUPER_ADMIN_USERNAME', 'zeryyern_admin')
+SUPER_ADMIN_EMAIL = os.getenv('SUPER_ADMIN_EMAIL', 'zeryyern_admin@hoax-monitor.com')
+SUPER_ADMIN_PASSWORD = os.getenv('SUPER_ADMIN_PASSWORD', '').strip()
+BOOTSTRAP_ADMIN_TOKEN = os.getenv('BOOTSTRAP_ADMIN_TOKEN', '').strip()
+BOOTSTRAP_ADMIN_ENABLED = os.getenv('BOOTSTRAP_ADMIN_ENABLED', 'false').lower() == 'true'
 
 # ===============================
 # SCRAPER SETTINGS
@@ -66,7 +82,10 @@ SOURCES = [
 
 API_HOST = os.getenv('API_HOST', '0.0.0.0')
 API_PORT = int(os.getenv('API_PORT', '5000'))
-API_ENV = os.getenv('API_ENV', 'development')
+
+if API_ENV == 'production':
+    if not CORS_ORIGINS or CORS_ORIGINS.strip() == '*':
+        raise RuntimeError("CORS_ORIGINS must be a non-wildcard value in production")
 
 # ===============================
 # ML/NLP SETTINGS

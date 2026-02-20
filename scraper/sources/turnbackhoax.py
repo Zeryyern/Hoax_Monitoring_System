@@ -3,10 +3,10 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 import time
 from dateutil import parser as date_parser
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
-# Suppress SSL warnings when verify=False is used
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+
+
 
 from scraper.utils import is_valid_article_url
 
@@ -27,7 +27,7 @@ def extract_published_date(article_url, session=None):
     try:
         if session is None:
             session = requests.Session()
-            session.verify = False
+            session.verify = True
         response = session.get(article_url, headers=HEADERS, timeout=10)
         if response.status_code != 200:
             return None
@@ -61,7 +61,7 @@ def extract_published_date(article_url, session=None):
 def scrape_turnbackhoax(pages=3):
     session = requests.Session()
     session.headers.update(HEADERS)
-    session.verify = False
+    session.verify = True
 
     articles = []
     seen = set()

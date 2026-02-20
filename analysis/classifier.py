@@ -141,6 +141,12 @@ LEGITIMACY_INDICATORS = {
     ]
 }
 
+# Conservative thresholds to reduce false "Legitimate" outcomes.
+# If signal is weak/ambiguous, classify as Hoax with lower confidence.
+HOAX_DECISION_THRESHOLD = 0.45
+AMBIGUOUS_BAND_MIN = 0.40
+AMBIGUOUS_BAND_MAX = 0.60
+
 
 def detect_hoax_signal(text: str) -> tuple:
     """
@@ -185,7 +191,8 @@ def classify_article(text: str) -> tuple:
     - confidence: float between 0.0 and 1.0
     """
     if not text or len(text.strip()) < 20:
-        return 'Legitimate', 0.3  # Too short to classify confidently
+        # Too short to verify safely: avoid returning Legitimate.
+        return 'Hoax', 0.4
     
     hoax_score, legit_score, hoax_count, legit_count = detect_hoax_signal(text)
     
@@ -223,8 +230,13 @@ def classify_article(text: str) -> tuple:
         (1 - balance_score) * balance_weight
     )
     
-    # Determine prediction
-    if final_hoax_score > 0.5:
+    # Determine prediction (conservative policy):
+    # - classify Hoax at lower threshold
+    # - treat ambiguous middle band as Hoax with lower confidence
+    if AMBIGUOUS_BAND_MIN <= final_hoax_score <= AMBIGUOUS_BAND_MAX:
+        prediction = 'Hoax'
+        confidence = max(0.45, min(final_hoax_score, 0.7))
+    elif final_hoax_score >= HOAX_DECISION_THRESHOLD:
         prediction = 'Hoax'
         confidence = min(final_hoax_score, 0.99)
     else:
@@ -234,6 +246,17 @@ def classify_article(text: str) -> tuple:
     # Confidence floor: if signals are weak, lower confidence
     total_signals = hoax_count + legit_count
     if total_signals < 2:
-        confidence = max(0.4, confidence * 0.6)
-    
+        prediction = 'Hoax'
+        confidence = 0.45
+
+    # Explicit misinformation keywords should force Hoax unless confidence is very strong otherwise.
+    explicit_hoax_terms = [
+        "hoax", "palsu", "bohong", "false", "fake", "disinformasi",
+        "misinformasi", "menyesatkan", "tidak benar", "cek fakta"
+    ]
+    text_lower = text.lower()
+    if any(term in text_lower for term in explicit_hoax_terms):
+        prediction = 'Hoax'
+        confidence = max(confidence, 0.65)
+
     return prediction, round(confidence, 3)

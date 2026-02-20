@@ -6,14 +6,25 @@ from threading import Thread, Event, Lock
 import time
 from auth import (
     token_required, admin_required, 
-    authenticate_user, create_user, get_user_by_id,
+    authenticate_user, create_user, get_user_by_id, get_user_by_email,
     create_token, log_admin_action as record_admin_action, hash_password, verify_password
 )
 from datetime import datetime, timedelta
-from config import CORS_ORIGINS, API_ENV, API_HOST, API_PORT, DEBUG
+from config import (
+    CORS_ORIGINS,
+    API_ENV,
+    API_HOST,
+    API_PORT,
+    DEBUG,
+    SUPER_ADMIN_USERNAME,
+    SUPER_ADMIN_EMAIL,
+    BOOTSTRAP_ADMIN_ENABLED,
+    BOOTSTRAP_ADMIN_TOKEN,
+)
 import json
 import traceback
 from typing import Optional
+import hmac
 
 SCRAPER_IMPORT_ERROR = None
 STORAGE_IMPORT_ERROR = None
@@ -60,15 +71,32 @@ except Exception as e:
 app = Flask(__name__)
 
 # Parse CORS origins
-if API_ENV.lower() == "development" or str(CORS_ORIGINS).strip() == "*":
-    origins = "*"
-else:
+def _parse_cors_origins(raw_origins: str):
+    raw_origins = (raw_origins or "").strip()
+    if not raw_origins:
+        if API_ENV.lower() == "development":
+            return [
+                "http://localhost:5173",
+                "http://127.0.0.1:5173",
+                "http://localhost:3000",
+                "http://127.0.0.1:3000",
+            ]
+        return []
+
+    if raw_origins == "*":
+        return "*"
+
     try:
-        origins = json.loads(CORS_ORIGINS)
+        parsed = json.loads(raw_origins)
+        if isinstance(parsed, list):
+            return [str(origin).strip() for origin in parsed if str(origin).strip()]
     except Exception:
-        origins = [origin.strip() for origin in str(CORS_ORIGINS).split(",") if origin.strip()]
-        if not origins:
-            origins = "*"
+        pass
+
+    return [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+
+
+origins = _parse_cors_origins(CORS_ORIGINS)
 
 CORS(app, resources={r"/api/*": {"origins": origins}})
 
@@ -77,12 +105,21 @@ init_db()
 
 # Seed initial data
 try:
-    from seed_data import seed_database, seed_admin_user, seed_test_users
-    seed_database()
+    from seed_data import seed_admin_user
+
+    # Ensure immutable super-admin account metadata is aligned.
+    # Password is only created from explicit env bootstrap (no defaults).
     seed_admin_user()
-    seed_test_users()
 except Exception as e:
     print(f"Warning: Could not seed data: {e}")
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 # ===============================
 # UTILITY FUNCTIONS
@@ -98,11 +135,70 @@ def success_response(data=None, message="Success", status_code=200):
 
 def error_response(message="Error", status_code=400, details=None):
     """Format error response"""
-    return jsonify({
+    payload = {
         "status": "error",
         "message": message,
-        "details": details
+    }
+    if DEBUG and details is not None:
+        payload["details"] = details
+    return jsonify({
+        **payload
     }), status_code
+
+
+def _is_super_admin_username(username: Optional[str]) -> bool:
+    return (username or "").strip().lower() == SUPER_ADMIN_USERNAME.strip().lower()
+
+
+def _current_user_is_super_admin() -> bool:
+    return _is_super_admin_username(request.current_user.get("username"))
+
+
+def _client_ip() -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "").strip()
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+LOGIN_ATTEMPTS: dict[str, dict] = {}
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_WINDOW_MINUTES = 15
+LOGIN_BLOCK_MINUTES = 15
+
+
+def _login_attempt_key(email: str) -> str:
+    return f"{_client_ip()}::{(email or '').strip().lower()}"
+
+
+def _is_login_rate_limited(email: str) -> bool:
+    key = _login_attempt_key(email)
+    state = LOGIN_ATTEMPTS.get(key)
+    if not state:
+        return False
+    blocked_until = state.get("blocked_until")
+    if blocked_until and datetime.utcnow() < blocked_until:
+        return True
+    return False
+
+
+def _record_login_failure(email: str):
+    key = _login_attempt_key(email)
+    now = datetime.utcnow()
+    state = LOGIN_ATTEMPTS.get(key, {"failed": 0, "first_failed_at": now, "blocked_until": None})
+
+    first_failed_at = state.get("first_failed_at") or now
+    if now - first_failed_at > timedelta(minutes=LOGIN_WINDOW_MINUTES):
+        state = {"failed": 0, "first_failed_at": now, "blocked_until": None}
+
+    state["failed"] = int(state.get("failed", 0)) + 1
+    if state["failed"] >= MAX_LOGIN_ATTEMPTS:
+        state["blocked_until"] = now + timedelta(minutes=LOGIN_BLOCK_MINUTES)
+    LOGIN_ATTEMPTS[key] = state
+
+
+def _clear_login_failures(email: str):
+    LOGIN_ATTEMPTS.pop(_login_attempt_key(email), None)
 
 # ===============================
 # SCRAPING CONTROL
@@ -125,6 +221,7 @@ SCRAPER_SOURCES = {
 }
 
 SCRAPER_SOURCES = {key: value for key, value in SCRAPER_SOURCES.items() if value[1] is not None}
+SCRAPER_SOURCE_NAMES = tuple(ALL_SCRAPER_SOURCES.values())
 
 
 def _to_news_date(published_at: Optional[str]) -> str:
@@ -135,6 +232,14 @@ def _to_news_date(published_at: Optional[str]) -> str:
         return datetime.fromisoformat(value).strftime("%Y-%m-%d")
     except Exception:
         return datetime.now().strftime("%Y-%m-%d")
+
+
+def _source_filter_sql() -> tuple[str, list[str]]:
+    """Restrict user-facing news endpoints to configured scraper sources."""
+    if not SCRAPER_SOURCE_NAMES:
+        return "1=0", []
+    placeholders = ", ".join("?" for _ in SCRAPER_SOURCE_NAMES)
+    return f"source IN ({placeholders})", list(SCRAPER_SOURCE_NAMES)
 
 
 def _persist_scraped_to_news(items: list[dict]) -> int:
@@ -161,6 +266,11 @@ def _persist_scraped_to_news(items: list[dict]) -> int:
                     continue
 
             prediction, confidence = classify_article(title)
+            # Scraped sources are anti-hoax/fact-check feeds; avoid weak Legitimate labels.
+            # Only keep Legitimate when model confidence is strong.
+            if source in SCRAPER_SOURCE_NAMES and prediction == "Legitimate" and confidence < 0.85:
+                prediction = "Hoax"
+                confidence = max(0.6, round(1 - confidence, 3))
             cursor.execute(
                 """
                 INSERT INTO news (title, content, source, source_url, category, date, prediction, confidence)
@@ -423,7 +533,8 @@ def api_info():
             "news": ["/api/news", "/api/news/<id>"],
             "analyze": ["/api/analyze"],
             "admin": ["/api/admin/dashboard", "/api/admin/users"],
-            "user": ["/api/user/profile", "/api/user/analysis"]
+            "user": ["/api/user/profile", "/api/user/analysis"],
+            "bootstrap": ["/api/auth/bootstrap-super-admin"]
         }
     })
 
@@ -477,14 +588,33 @@ def login():
         
         email = data.get('email', '').strip().lower()
         password = data.get('password', '').strip()
+        login_type = data.get('login_type', 'any').strip().lower()
         
         if not email or not password:
             return error_response("Email and password required", 400)
+
+        if login_type not in ['any', 'user', 'admin']:
+            return error_response("Invalid login type", 400)
+
+        if _is_login_rate_limited(email):
+            return error_response(
+                f"Too many login attempts. Try again in {LOGIN_BLOCK_MINUTES} minutes.",
+                429
+            )
         
         success, token, user, error_msg = authenticate_user(email, password)
         
         if not success:
+            _record_login_failure(email)
             return error_response(error_msg, 401)
+
+        _clear_login_failures(email)
+
+        if login_type == 'user' and user.get('role') != 'user':
+            return error_response("This account must use Admin Login", 403)
+
+        if login_type == 'admin' and user.get('role') != 'admin':
+            return error_response("Admin access required", 403)
         
         return success_response({
             "token": token,
@@ -493,6 +623,76 @@ def login():
         
     except Exception as e:
         return error_response(f"Login failed: {str(e)}", 500, traceback.format_exc())
+
+
+@app.route("/api/auth/bootstrap-super-admin", methods=["POST"])
+def bootstrap_super_admin():
+    """
+    One-time bootstrap endpoint for creating/resetting super admin credentials.
+    Enabled only when BOOTSTRAP_ADMIN_ENABLED=true and protected by X-Bootstrap-Token.
+    """
+    try:
+        if not BOOTSTRAP_ADMIN_ENABLED:
+            return error_response("Bootstrap endpoint is disabled", 403)
+
+        if not BOOTSTRAP_ADMIN_TOKEN:
+            return error_response("Bootstrap token is not configured", 500)
+
+        provided_token = request.headers.get("X-Bootstrap-Token", "").strip()
+        if not provided_token or not hmac.compare_digest(provided_token, BOOTSTRAP_ADMIN_TOKEN):
+            return error_response("Invalid bootstrap token", 401)
+
+        data = request.get_json() or {}
+        password = (data.get("password") or "").strip()
+        if len(password) < 12:
+            return error_response("Password must be at least 12 characters", 400)
+
+        existing = get_user_by_email(SUPER_ADMIN_EMAIL)
+
+        if existing:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE users
+                SET username = ?,
+                    role = 'admin',
+                    is_active = 1,
+                    password_hash = ?
+                WHERE email = ?
+                """,
+                (SUPER_ADMIN_USERNAME, hash_password(password), SUPER_ADMIN_EMAIL),
+            )
+            conn.commit()
+            conn.close()
+            user = get_user_by_email(SUPER_ADMIN_EMAIL)
+        else:
+            success, user, error_msg = create_user(
+                username=SUPER_ADMIN_USERNAME,
+                email=SUPER_ADMIN_EMAIL,
+                password=password,
+                role="admin",
+            )
+            if not success:
+                return error_response(error_msg or "Failed to create super admin", 400)
+
+        token = create_token(user["id"], user["username"], "admin")
+        return success_response(
+            {
+                "token": token,
+                "user": {
+                    "id": user["id"],
+                    "username": user["username"],
+                    "email": user["email"],
+                    "role": "admin",
+                },
+                "note": "Disable BOOTSTRAP_ADMIN_ENABLED after setup.",
+            },
+            "Super admin bootstrapped",
+            201,
+        )
+    except Exception as e:
+        return error_response(f"Bootstrap failed: {str(e)}", 500, traceback.format_exc())
 
 @app.route("/api/auth/me", methods=["GET"])
 @token_required
@@ -588,13 +788,15 @@ def get_recent_hoaxes():
         
         conn = get_connection()
         cursor = conn.cursor()
+        source_clause, source_params = _source_filter_sql()
         
-        cursor.execute("""
-            SELECT id, title, source, category, date, prediction, confidence 
+        cursor.execute(f"""
+            SELECT id, title, source, source_url, category, date, prediction, confidence, created_at
             FROM news 
-            ORDER BY date DESC 
+            WHERE {source_clause}
+            ORDER BY created_at DESC 
             LIMIT ?
-        """, (limit,))
+        """, (*source_params, limit))
         
         hoaxes = list_from_rows(cursor.fetchall())
         conn.close()
@@ -622,8 +824,9 @@ def get_news():
         cursor = conn.cursor()
         
         # Build query
-        query = "SELECT id, title, source, category, date, prediction, confidence FROM news WHERE 1=1"
-        params = []
+        source_clause, source_params = _source_filter_sql()
+        query = f"SELECT id, title, source, source_url, category, date, prediction, confidence, created_at FROM news WHERE {source_clause}"
+        params = list(source_params)
         
         if category:
             query += " AND category = ?"
@@ -639,12 +842,15 @@ def get_news():
             params.extend([search_term, search_term])
         
         # Count total
-        count_query = query.replace("SELECT id, title, source, category, date, prediction, confidence", "SELECT COUNT(*) as count")
+        count_query = query.replace(
+            "SELECT id, title, source, source_url, category, date, prediction, confidence, created_at",
+            "SELECT COUNT(*) as count",
+        )
         cursor.execute(count_query, params)
         total = cursor.fetchone()['count']
         
         # Get paginated results
-        query += " ORDER BY date DESC LIMIT ? OFFSET ?"
+        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         
         cursor.execute(query, params)
@@ -670,7 +876,11 @@ def get_news_detail(news_id):
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM news WHERE id = ?", (news_id,))
+        source_clause, source_params = _source_filter_sql()
+        cursor.execute(
+            f"SELECT * FROM news WHERE id = ? AND {source_clause}",
+            (news_id, *source_params),
+        )
         news = dict_from_row(cursor.fetchone())
         conn.close()
         
@@ -873,6 +1083,162 @@ def admin_stop_single_source_loop(source_key):
     except Exception as e:
         return error_response(str(e), 500, traceback.format_exc())
 
+@app.route("/api/admin/scraping/reset-data", methods=["POST"])
+@admin_required
+def admin_reset_scraped_data():
+    """Hard reset analysis datasets used by dashboard/NLP/charts/homepage."""
+    try:
+        # Stop running loops first so data is not reinserted during cleanup.
+        scraping_manager.stop()
+
+        removed_analysis = 0
+        removed_news = 0
+        removed_source_runs_api = 0
+        removed_hoaxes_scraper = 0
+        removed_source_runs_scraper = 0
+        removed_runs_scraper = 0
+
+        cleanup_errors = []
+
+        # API database cleanup (news, user_analysis, optional source_runs mirror).
+        api_conn = get_connection()
+        api_cursor = api_conn.cursor()
+
+        api_cursor.execute("SELECT COUNT(*) as count FROM user_analysis")
+        removed_analysis = api_cursor.fetchone()["count"] or 0
+        api_cursor.execute("DELETE FROM user_analysis")
+
+        api_cursor.execute("SELECT COUNT(*) as count FROM news")
+        removed_news = api_cursor.fetchone()["count"] or 0
+        api_cursor.execute("DELETE FROM news")
+
+        try:
+            api_cursor.execute("SELECT COUNT(*) as count FROM source_runs")
+            removed_source_runs_api = api_cursor.fetchone()["count"] or 0
+            api_cursor.execute("DELETE FROM source_runs")
+        except Exception:
+            removed_source_runs_api = 0
+
+        api_conn.commit()
+        api_conn.close()
+
+        # Clear scraper database tables too (raw scraped tables/history).
+        if get_scraper_connection is not None:
+            try:
+                scraper_conn = get_scraper_connection()
+                scraper_cursor = scraper_conn.cursor()
+
+                try:
+                    scraper_cursor.execute("SELECT COUNT(*) as count FROM hoaxes")
+                    removed_hoaxes_scraper = scraper_cursor.fetchone()["count"] or 0
+                    scraper_cursor.execute("DELETE FROM hoaxes")
+                except Exception:
+                    removed_hoaxes_scraper = 0
+
+                try:
+                    scraper_cursor.execute("SELECT COUNT(*) as count FROM source_runs")
+                    removed_source_runs_scraper = scraper_cursor.fetchone()["count"] or 0
+                    scraper_cursor.execute("DELETE FROM source_runs")
+                except Exception:
+                    removed_source_runs_scraper = 0
+
+                try:
+                    scraper_cursor.execute("SELECT COUNT(*) as count FROM runs")
+                    removed_runs_scraper = scraper_cursor.fetchone()["count"] or 0
+                    scraper_cursor.execute("DELETE FROM runs")
+                except Exception:
+                    removed_runs_scraper = 0
+
+                scraper_conn.commit()
+                scraper_conn.close()
+            except Exception as e:
+                cleanup_errors.append(f"scraper_db_cleanup_failed: {e}")
+        else:
+            cleanup_errors.append("scraper_db_connection_unavailable")
+
+        # Reset in-memory scraping status snapshot.
+        scraping_manager.last_summary = {}
+        scraping_manager.last_run_at = None
+        scraping_manager.started_at = None
+        for source_key in scraping_manager.source_workers:
+            worker = scraping_manager.source_workers[source_key]
+            worker["last_run_at"] = None
+            worker["started_at"] = None
+            worker["is_running"] = False
+
+        # Verify remaining counts after cleanup.
+        remaining = {
+            "news": 0,
+            "user_analysis": 0,
+            "api_source_runs": 0,
+            "scraper_hoaxes": 0,
+            "scraper_source_runs": 0,
+            "scraper_runs": 0,
+        }
+        verify_conn = get_connection()
+        verify_cursor = verify_conn.cursor()
+        try:
+            verify_cursor.execute("SELECT COUNT(*) as count FROM news")
+            remaining["news"] = verify_cursor.fetchone()["count"] or 0
+            verify_cursor.execute("SELECT COUNT(*) as count FROM user_analysis")
+            remaining["user_analysis"] = verify_cursor.fetchone()["count"] or 0
+            try:
+                verify_cursor.execute("SELECT COUNT(*) as count FROM source_runs")
+                remaining["api_source_runs"] = verify_cursor.fetchone()["count"] or 0
+            except Exception:
+                remaining["api_source_runs"] = 0
+        finally:
+            verify_conn.close()
+
+        if get_scraper_connection is not None:
+            try:
+                sconn = get_scraper_connection()
+                scursor = sconn.cursor()
+                try:
+                    scursor.execute("SELECT COUNT(*) as count FROM hoaxes")
+                    remaining["scraper_hoaxes"] = scursor.fetchone()["count"] or 0
+                except Exception:
+                    remaining["scraper_hoaxes"] = 0
+                try:
+                    scursor.execute("SELECT COUNT(*) as count FROM source_runs")
+                    remaining["scraper_source_runs"] = scursor.fetchone()["count"] or 0
+                except Exception:
+                    remaining["scraper_source_runs"] = 0
+                try:
+                    scursor.execute("SELECT COUNT(*) as count FROM runs")
+                    remaining["scraper_runs"] = scursor.fetchone()["count"] or 0
+                except Exception:
+                    remaining["scraper_runs"] = 0
+                sconn.close()
+            except Exception as e:
+                cleanup_errors.append(f"scraper_db_verify_failed: {e}")
+
+        record_admin_action(
+            request.current_user['user_id'],
+            "RESET_SCRAPED_DATA",
+            (
+                f"Deleted news={removed_news}, user_analysis={removed_analysis}, "
+                f"api_source_runs={removed_source_runs_api}, scraper_hoaxes={removed_hoaxes_scraper}, "
+                f"scraper_source_runs={removed_source_runs_scraper}, scraper_runs={removed_runs_scraper}"
+            ),
+        )
+
+        return success_response(
+            {
+                "removed_news": removed_news,
+                "removed_user_analysis": removed_analysis,
+                "removed_api_source_runs": removed_source_runs_api,
+                "removed_scraper_hoaxes": removed_hoaxes_scraper,
+                "removed_scraper_source_runs": removed_source_runs_scraper,
+                "removed_scraper_runs": removed_runs_scraper,
+                "remaining": remaining,
+                "cleanup_errors": cleanup_errors,
+            },
+            "Scraped data has been reset",
+        )
+    except Exception as e:
+        return error_response(str(e), 500, traceback.format_exc())
+
 @app.route("/api/admin/users", methods=["GET"])
 @admin_required
 def admin_get_users():
@@ -895,6 +1261,8 @@ def admin_get_users():
             LIMIT ? OFFSET ?
         """, (limit, offset))
         users = list_from_rows(cursor.fetchall())
+        for user in users:
+            user["is_protected"] = _is_super_admin_username(user.get("username"))
         
         conn.close()
         
@@ -924,18 +1292,33 @@ def admin_change_user_role(user_id):
         
         conn = get_connection()
         cursor = conn.cursor()
-        
-        cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-        if not cursor.fetchone():
+
+        cursor.execute("SELECT id, username, role FROM users WHERE id = ?", (user_id,))
+        target_user = cursor.fetchone()
+        if not target_user:
+            conn.close()
             return error_response("User not found", 404)
-        
+
+        target_username = target_user["username"]
+        target_role = target_user["role"]
+        requester_is_super = _current_user_is_super_admin()
+
+        if _is_super_admin_username(target_username):
+            conn.close()
+            return error_response("Super admin account cannot be altered", 403)
+
+        # Only super admin can promote to admin or alter existing admin accounts.
+        if not requester_is_super and (new_role == "admin" or target_role == "admin"):
+            conn.close()
+            return error_response("Only super admin can manage admin roles", 403)
+
         cursor.execute("UPDATE users SET role = ? WHERE id = ?", (new_role, user_id))
         conn.commit()
         
         record_admin_action(
             request.current_user['user_id'],
             "CHANGE_USER_ROLE",
-            f"Changed user {user_id} role to {new_role}"
+            f"Changed user {user_id} ({target_username}) role from {target_role} to {new_role}"
         )
         
         conn.close()
@@ -956,10 +1339,24 @@ def admin_delete_user(user_id):
         conn = get_connection()
         cursor = conn.cursor()
 
-        cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-        if not cursor.fetchone():
+        cursor.execute("SELECT id, username, role FROM users WHERE id = ?", (user_id,))
+        target_user = cursor.fetchone()
+        if not target_user:
             conn.close()
             return error_response("User not found", 404)
+
+        target_username = target_user["username"]
+        target_role = target_user["role"]
+        requester_is_super = _current_user_is_super_admin()
+
+        if _is_super_admin_username(target_username):
+            conn.close()
+            return error_response("Super admin account cannot be deleted", 403)
+
+        # Only super admin can delete admin accounts.
+        if not requester_is_super and target_role == "admin":
+            conn.close()
+            return error_response("Only super admin can delete admin accounts", 403)
 
         cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
         conn.commit()
@@ -968,7 +1365,7 @@ def admin_delete_user(user_id):
         record_admin_action(
             request.current_user['user_id'],
             "DELETE_USER",
-            f"Deleted user {user_id}"
+            f"Deleted user {user_id} ({target_username})"
         )
 
         return success_response(None, "User deleted successfully")
@@ -1005,6 +1402,9 @@ def change_password():
         
         if len(new_password) < 8:
             return error_response("New password must be at least 8 characters", 400)
+
+        if _current_user_is_super_admin():
+            return error_response("Super admin credentials are immutable", 403)
         
         conn = get_connection()
         cursor = conn.cursor()
@@ -1077,7 +1477,7 @@ def user_analysis_history():
 def statistics_recent():
     """Get recent statistics with trend data"""
     try:
-        days = int(request.args.get('days', 7))
+        days = max(1, min(365, int(request.args.get('days', 7))))
         
         conn = get_connection()
         cursor = conn.cursor()
@@ -1166,6 +1566,18 @@ def get_admin_logs():
         # Get total count
         cursor.execute("SELECT COUNT(*) as count FROM admin_logs")
         total = cursor.fetchone()['count']
+
+        # Get today's total (local time for admin-facing UI)
+        cursor.execute("""
+            SELECT COUNT(*) as count
+            FROM admin_logs
+            WHERE date(created_at, 'localtime') = date('now', 'localtime')
+        """)
+        today_total = cursor.fetchone()['count']
+
+        # Unique admins across all logs
+        cursor.execute("SELECT COUNT(DISTINCT admin_id) as count FROM admin_logs")
+        unique_admins_total = cursor.fetchone()['count']
         
         # Get logs with user info
         cursor.execute("""
@@ -1184,11 +1596,35 @@ def get_admin_logs():
         return success_response({
             "logs": logs,
             "total": total,
+            "today_total": today_total,
+            "unique_admins_total": unique_admins_total,
+            "can_reset": _current_user_is_super_admin(),
             "page": page,
             "limit": limit,
             "total_pages": (total + limit - 1) // limit
         })
         
+    except Exception as e:
+        return error_response(str(e), 500, traceback.format_exc())
+
+
+@app.route("/api/admin/logs/reset", methods=["POST"])
+@admin_required
+def reset_admin_logs():
+    """Reset all admin activity logs (super admin only)."""
+    try:
+        if not _current_user_is_super_admin():
+            return error_response("Only super admin can reset activity logs", 403)
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) as count FROM admin_logs")
+        removed_count = cursor.fetchone()["count"] or 0
+        cursor.execute("DELETE FROM admin_logs")
+        conn.commit()
+        conn.close()
+
+        return success_response({"removed": removed_count}, "Activity logs reset successfully")
     except Exception as e:
         return error_response(str(e), 500, traceback.format_exc())
 
@@ -1230,5 +1666,9 @@ def server_error(error):
     return error_response("Internal server error", 500)
 
 if __name__ == "__main__":
-    app.run(debug=DEBUG, host=API_HOST, port=API_PORT, use_reloader=False)
+    if API_ENV.lower() == "production":
+        from waitress import serve
+        serve(app, host=API_HOST, port=API_PORT)
+    else:
+        app.run(debug=DEBUG, host=API_HOST, port=API_PORT, use_reloader=False)
 

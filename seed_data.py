@@ -177,41 +177,53 @@ def seed_database():
     return True  # Successfully seeded
 
 def seed_admin_user():
-    """Ensure default admin user exists and has admin privileges"""
-    from auth import get_user_by_email, create_user, hash_password
+    """Ensure super admin exists only when explicitly bootstrapped."""
+    from auth import get_user_by_email, create_user
     from database import get_connection
-    
-    admin_email = "admin@hoax-monitor.com"
-    admin_password = "SecurePassword123!"
-    
-    # If admin email exists, force it to be an active admin with known password
-    existing = get_user_by_email(admin_email)
-    if existing:
+    from config import SUPER_ADMIN_USERNAME, SUPER_ADMIN_EMAIL, SUPER_ADMIN_PASSWORD
+
+    # Ensure immutable super admin exists and is active admin.
+    super_existing = get_user_by_email(SUPER_ADMIN_EMAIL)
+    if super_existing:
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute(
             """
             UPDATE users
-            SET role = 'admin',
-                is_active = 1,
-                password_hash = ?
+            SET username = ?,
+                role = 'admin',
+                is_active = 1
             WHERE email = ?
             """,
-            (hash_password(admin_password), admin_email)
+            (SUPER_ADMIN_USERNAME, SUPER_ADMIN_EMAIL)
         )
         conn.commit()
         conn.close()
         return True
-    
-    # Create admin
-    success, user, error = create_user(
-        username="admin",
-        email=admin_email,
-        password=admin_password,
+
+    # Do not create any admin with implicit/default credentials.
+    # Initial super-admin password must be explicitly provided via env.
+    if not SUPER_ADMIN_PASSWORD:
+        return False
+
+    super_success, _, _ = create_user(
+        username=SUPER_ADMIN_USERNAME,
+        email=SUPER_ADMIN_EMAIL,
+        password=SUPER_ADMIN_PASSWORD,
         role="admin"
     )
-    
-    return success
+
+    if super_success:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET is_active = 1 WHERE email = ?",
+            (SUPER_ADMIN_EMAIL,)
+        )
+        conn.commit()
+        conn.close()
+
+    return super_success
 
 def seed_test_users():
     """Create default test users"""
