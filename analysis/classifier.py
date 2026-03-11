@@ -2,6 +2,11 @@ import re
 from collections import Counter
 from typing import Dict, List
 
+try:
+    from config import CONFIDENCE_THRESHOLD
+except Exception:
+    CONFIDENCE_THRESHOLD = 0.5
+
 # ---------------------------------------------------------
 # CONFIGURATION (Professional Separation of Concerns)
 # ---------------------------------------------------------
@@ -141,9 +146,9 @@ LEGITIMACY_INDICATORS = {
     ]
 }
 
-# Conservative thresholds to reduce false "Legitimate" outcomes.
-# If signal is weak/ambiguous, classify as Hoax with lower confidence.
-HOAX_DECISION_THRESHOLD = 0.45
+# Conservative threshold to reduce false "Legitimate" outcomes.
+# This can be tuned centrally via config.CONFIDENCE_THRESHOLD.
+HOAX_DECISION_THRESHOLD = float(CONFIDENCE_THRESHOLD)
 AMBIGUOUS_BAND_MIN = 0.40
 AMBIGUOUS_BAND_MAX = 0.60
 
@@ -180,6 +185,33 @@ def detect_hoax_signal(text: str) -> tuple:
     legit_score = min(legit_count / max(1, total_words / 10), 1.0)
     
     return hoax_score, legit_score, hoax_count, legit_count
+
+
+def detect_primary_category(text: str) -> str:
+    """
+    Detect the strongest content category based on weighted keyword matching.
+    Returns one of configured categories or 'other' when evidence is weak.
+    """
+    if not text:
+        return "other"
+
+    tokens = tokenize(text)
+    token_counts = Counter(tokens)
+    category_scores: Dict[str, int] = {}
+
+    for category, config in CATEGORIES.items():
+        raw_score = sum(token_counts.get(word, 0) for word in config["keywords"])
+        weighted_score = raw_score * int(config["weight"])
+        category_scores[category] = weighted_score
+
+    if not category_scores:
+        return "other"
+
+    best_category = max(category_scores, key=category_scores.get)
+    best_score = category_scores.get(best_category, 0)
+    if best_score < MIN_SCORE_THRESHOLD:
+        return "other"
+    return best_category
 
 
 def classify_article(text: str) -> tuple:
@@ -243,11 +275,11 @@ def classify_article(text: str) -> tuple:
         prediction = 'Legitimate'
         confidence = min(1 - final_hoax_score, 0.99)
     
-    # Confidence floor: if signals are weak, lower confidence
+    # Confidence floor: if signals are weak, avoid overconfident labels.
     total_signals = hoax_count + legit_count
     if total_signals < 2:
-        prediction = 'Hoax'
-        confidence = 0.45
+        prediction = 'Legitimate'
+        confidence = 0.5
 
     # Explicit misinformation keywords should force Hoax unless confidence is very strong otherwise.
     explicit_hoax_terms = [

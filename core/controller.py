@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 from logger import logger
 from core.runner import run_once
 
+MAX_RUNTIME_SECONDS = 10 * 60 * 60  # 10 hours hard cap
+
 
 class ExecutionController:
     def __init__(self):
@@ -25,7 +27,14 @@ class ExecutionController:
             logger.warning("Controller already running")
             return
 
-        logger.info("Controller: Starting continuous mode")
+        effective_max_runtime = MAX_RUNTIME_SECONDS
+        if max_runtime_seconds:
+            effective_max_runtime = min(MAX_RUNTIME_SECONDS, max(60, int(max_runtime_seconds)))
+
+        logger.info(
+            "Controller: Starting continuous mode "
+            f"(interval={interval_seconds}s, auto_stop={effective_max_runtime}s)"
+        )
         self.is_running = True
 
         def _run_loop():
@@ -35,12 +44,11 @@ class ExecutionController:
                 run_once()
 
                 # Check max runtime
-                if max_runtime_seconds:
-                    elapsed = datetime.now() - start_time
-                    if elapsed >= timedelta(seconds=max_runtime_seconds):
-                        logger.info("Controller: Max runtime reached. Stopping.")
-                        self.is_running = False
-                        break
+                elapsed = datetime.now() - start_time
+                if elapsed >= timedelta(seconds=effective_max_runtime):
+                    logger.info("Controller: Max runtime reached. Stopping.")
+                    self.is_running = False
+                    break
 
                 logger.info(f"Controller: Sleeping for {interval_seconds} seconds")
                 time.sleep(interval_seconds)

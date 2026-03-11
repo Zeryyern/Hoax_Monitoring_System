@@ -1,6 +1,6 @@
 ﻿from flask import Flask, jsonify, request
 from flask_cors import CORS
-from analysis.classifier import classify_article
+from analysis.classifier import classify_article, detect_primary_category
 from database import get_connection, init_db, dict_from_row, list_from_rows
 from threading import Thread, Event, Lock
 import time
@@ -28,17 +28,26 @@ from config import (
     SMTP_PASSWORD,
     SMTP_USE_TLS,
     EMAIL_FROM,
+    CONFIDENCE_THRESHOLD,
+    MIN_TEXT_LENGTH,
 )
 import json
 import traceback
 from typing import Optional
 import hmac
+import re
 
 SCRAPER_IMPORT_ERROR = None
 STORAGE_IMPORT_ERROR = None
 
 try:
-    from scraper.fetch import safe_run, normalize_and_filter
+    from scraper.utils import clean_scraped_title
+except Exception:
+    def clean_scraped_title(title: str) -> str:
+        return (title or "").strip()
+
+try:
+    from scraper.fetch import safe_run, normalize_and_filter, enrich_missing_published_at
     from scraper.sources.turnbackhoax import scrape_turnbackhoax
     from scraper.sources.antaranews import scrape_antaranews
     from scraper.sources.kompas_cekfakta import scrape_kompas_cekfakta
@@ -48,6 +57,7 @@ except Exception as e:
     SCRAPER_IMPORT_ERROR = str(e)
     safe_run = None
     normalize_and_filter = None
+    enrich_missing_published_at = None
     scrape_turnbackhoax = None
     scrape_antaranews = None
     scrape_kompas_cekfakta = None
@@ -251,6 +261,8 @@ ALL_SCRAPER_SOURCES = {
     "tempo_hoax": "Tempo Hoax",
 }
 
+MAX_SCRAPER_RUNTIME_SECONDS = 10 * 60 * 60  # 10 hours hard cap
+
 SCRAPER_SOURCES = {
     "turnbackhoax": ("TurnBackHoax", scrape_turnbackhoax),
     "antaranews": ("Antara Anti-Hoax", scrape_antaranews),
@@ -263,14 +275,24 @@ SCRAPER_SOURCES = {key: value for key, value in SCRAPER_SOURCES.items() if value
 SCRAPER_SOURCE_NAMES = tuple(ALL_SCRAPER_SOURCES.values())
 
 
-def _to_news_date(published_at: Optional[str]) -> str:
+def _to_news_date(published_at: Optional[str]) -> Optional[str]:
     if not published_at:
-        return datetime.now().strftime("%Y-%m-%d")
+        return None
     try:
         value = published_at.replace("Z", "+00:00")
         return datetime.fromisoformat(value).strftime("%Y-%m-%d")
     except Exception:
-        return datetime.now().strftime("%Y-%m-%d")
+        return None
+
+
+def _normalize_source_published_at(published_at: Optional[str]) -> Optional[str]:
+    if not published_at:
+        return None
+    try:
+        value = published_at.replace("Z", "+00:00")
+        return datetime.fromisoformat(value).isoformat()
+    except Exception:
+        return None
 
 
 def _source_filter_sql() -> tuple[str, list[str]]:
@@ -279,6 +301,70 @@ def _source_filter_sql() -> tuple[str, list[str]]:
         return "1=0", []
     placeholders = ", ".join("?" for _ in SCRAPER_SOURCE_NAMES)
     return f"source IN ({placeholders})", list(SCRAPER_SOURCE_NAMES)
+
+
+def _sanitize_news_row(item: dict) -> dict:
+    if not item:
+        return item
+    row = dict(item)
+    raw_title = row.get("title", "")
+    cleaned = clean_scraped_title(raw_title)
+    # Remove obvious tracking fragments accidentally captured as part of a title.
+    if "utm_" in (cleaned or ""):
+        cleaned = cleaned.split("?", 1)[0].strip()
+    row["title"] = cleaned or (raw_title or "").strip()
+    return row
+
+
+def _sanitize_news_rows(items: list[dict]) -> list[dict]:
+    return [_sanitize_news_row(item) for item in items]
+
+
+_BAD_TITLE_EXACT = {
+    "login",
+    "log in",
+    "sign in",
+    "signin",
+    "home",
+    "index",
+    "beranda",
+    "403",
+    "404",
+    "500",
+}
+
+
+def _is_displayable_title(title: Optional[str]) -> bool:
+    value = (title or "").strip()
+    if not value:
+        return False
+    lowered = value.casefold()
+    if lowered in _BAD_TITLE_EXACT:
+        return False
+    # Reject titles that are just numbers or punctuation (scrape errors).
+    if re.fullmatch(r"[\d\s\W_]+", value, flags=re.UNICODE):
+        return False
+    # Very short titles are usually scrape failures ("Login", "Home", etc.)
+    if len(value) < 8 and not any(ch.isalpha() for ch in value):
+        return False
+    return True
+
+
+def _news_quality_filter_sql(table_alias: str = "") -> tuple[str, list[str]]:
+    """
+    SQL predicate to hide obvious scrape failures from user-facing news listings.
+    This is intentionally conservative (exact matches + numeric-only titles).
+    """
+    prefix = f"{table_alias}." if table_alias else ""
+    bad = sorted(_BAD_TITLE_EXACT)
+    placeholders = ", ".join("?" for _ in bad)
+    clause = (
+        f"TRIM({prefix}title) <> ''"
+        f" AND LOWER(TRIM({prefix}title)) NOT IN ({placeholders})"
+        # numeric-only titles (e.g. "363") are never valid headlines
+        f" AND NOT ({prefix}title GLOB '[0-9]*' AND {prefix}title NOT GLOB '*[^0-9]*')"
+    )
+    return clause, bad
 
 
 def _persist_scraped_to_news(items: list[dict]) -> int:
@@ -292,28 +378,51 @@ def _persist_scraped_to_news(items: list[dict]) -> int:
 
     try:
         for item in items:
-            title = (item.get("title") or "").strip()
+            raw_title = (item.get("title") or "").strip()
             source = (item.get("source") or "Scraper").strip()
             source_url = (item.get("url") or "").strip()
+            source_published_at = _normalize_source_published_at(item.get("published_at"))
+            news_date = _to_news_date(item.get("published_at"))
 
-            if not title:
+            if not raw_title:
+                continue
+            # Normalize title before persisting.
+            title = clean_scraped_title(raw_title)
+            if "utm_" in title:
+                title = title.split("?", 1)[0].strip()
+            if not _is_displayable_title(title):
+                # Skip obvious scrape failures (login pages, numeric-only titles, etc.).
                 continue
 
             if source_url:
-                cursor.execute("SELECT id FROM news WHERE source_url = ? LIMIT 1", (source_url,))
-                if cursor.fetchone():
+                cursor.execute(
+                    "SELECT id, title, date, published_at_source FROM news WHERE source_url = ? LIMIT 1",
+                    (source_url,),
+                )
+                existing = cursor.fetchone()
+                if existing:
+                    should_update_date = source_published_at and (
+                        not existing["published_at_source"]
+                        or existing["published_at_source"] != source_published_at
+                        or existing["date"] != news_date
+                    )
+                    should_update_title = clean_scraped_title(existing["title"] or "") != title
+                    if should_update_date or should_update_title:
+                        cursor.execute(
+                            """
+                            UPDATE news
+                            SET title = ?, date = ?, published_at_source = ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                            """,
+                            (title, news_date, source_published_at, existing["id"]),
+                        )
                     continue
 
             prediction, confidence = classify_article(title)
-            # Scraped sources are anti-hoax/fact-check feeds; avoid weak Legitimate labels.
-            # Only keep Legitimate when model confidence is strong.
-            if source in SCRAPER_SOURCE_NAMES and prediction == "Legitimate" and confidence < 0.85:
-                prediction = "Hoax"
-                confidence = max(0.6, round(1 - confidence, 3))
             cursor.execute(
                 """
-                INSERT INTO news (title, content, source, source_url, category, date, prediction, confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO news (title, content, source, source_url, category, date, published_at_source, prediction, confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     title,
@@ -321,7 +430,8 @@ def _persist_scraped_to_news(items: list[dict]) -> int:
                     source,
                     source_url or None,
                     "Scraped",
-                    _to_news_date(item.get("published_at")),
+                    news_date,
+                    source_published_at,
                     prediction,
                     confidence,
                 ),
@@ -338,6 +448,7 @@ def _persist_scraped_to_news(items: list[dict]) -> int:
 class ScrapingManager:
     def __init__(self):
         self.interval_seconds = 300
+        self.max_runtime_seconds = MAX_SCRAPER_RUNTIME_SECONDS
         self.started_at = None
         self.last_run_at = None
         self.lock = Lock()
@@ -347,6 +458,7 @@ class ScrapingManager:
             self.source_workers[source_key] = {
                 "is_running": False,
                 "interval_seconds": 300,
+                "max_runtime_seconds": MAX_SCRAPER_RUNTIME_SECONDS,
                 "started_at": None,
                 "last_run_at": None,
                 "thread": None,
@@ -384,6 +496,8 @@ class ScrapingManager:
 
         raw = safe_run(scraper_func, source_name)
         cleaned = normalize_and_filter(raw, source_name)
+        if enrich_missing_published_at is not None:
+            cleaned = enrich_missing_published_at(cleaned, source_name)
         inserted_scraper = save_articles(cleaned)
         inserted_news = _persist_scraped_to_news(cleaned)
 
@@ -404,6 +518,20 @@ class ScrapingManager:
         stop_event = worker["stop_event"]
 
         while not stop_event.is_set():
+            # Enforce hard max runtime per source loop.
+            started_at_raw = worker.get("started_at")
+            max_runtime_seconds = int(worker.get("max_runtime_seconds") or MAX_SCRAPER_RUNTIME_SECONDS)
+            if started_at_raw:
+                try:
+                    elapsed_seconds = (
+                        datetime.utcnow() - datetime.fromisoformat(str(started_at_raw))
+                    ).total_seconds()
+                    if elapsed_seconds >= max_runtime_seconds:
+                        stop_event.set()
+                        break
+                except Exception:
+                    pass
+
             try:
                 result = self.run_source_once(source_key)
                 worker["last_run_at"] = result["run_time"]
@@ -444,10 +572,14 @@ class ScrapingManager:
         """Start all sources continuously"""
         with self.lock:
             self.interval_seconds = max(30, int(interval_seconds or 300))
+            self.max_runtime_seconds = min(
+                MAX_SCRAPER_RUNTIME_SECONDS,
+                max(60, int(self.max_runtime_seconds or MAX_SCRAPER_RUNTIME_SECONDS)),
+            )
             self.started_at = datetime.utcnow().isoformat()
             started_any = False
             for source_key in ALL_SCRAPER_SOURCES:
-                if self.start_source(source_key, self.interval_seconds):
+                if self.start_source(source_key, self.interval_seconds, self.max_runtime_seconds):
                     started_any = True
             return started_any
 
@@ -457,7 +589,7 @@ class ScrapingManager:
             for source_key in ALL_SCRAPER_SOURCES:
                 self.stop_source(source_key)
 
-    def start_source(self, source_key: str, interval_seconds: int = 300):
+    def start_source(self, source_key: str, interval_seconds: int = 300, max_runtime_seconds: int = MAX_SCRAPER_RUNTIME_SECONDS):
         if source_key not in ALL_SCRAPER_SOURCES:
             raise ValueError("Unknown source key")
         if source_key not in SCRAPER_SOURCES:
@@ -469,6 +601,11 @@ class ScrapingManager:
             return False
 
         worker["interval_seconds"] = max(30, int(interval_seconds or 300))
+        # Always clamp runtime to 10 hours max to avoid hammering source servers.
+        worker["max_runtime_seconds"] = min(
+            MAX_SCRAPER_RUNTIME_SECONDS,
+            max(60, int(max_runtime_seconds or MAX_SCRAPER_RUNTIME_SECONDS)),
+        )
         worker["started_at"] = datetime.utcnow().isoformat()
         worker["stop_event"] = Event()
         worker["is_running"] = True
@@ -492,6 +629,9 @@ class ScrapingManager:
         metrics = []
 
         db_rows = {}
+        latest_success_rows = {}
+        news_totals_by_source = {}
+        scraper_totals_by_source = {}
         try:
             self._prepare_storage()
             conn = get_scraper_connection()
@@ -510,14 +650,62 @@ class ScrapingManager:
                     )
                     row = cursor.fetchone()
                     db_rows[source_key] = row
+                    cursor.execute(
+                        """
+                        SELECT run_time, articles_collected
+                        FROM source_runs
+                        WHERE source_name = ? AND status = 'SUCCESS'
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """,
+                        (source_name,),
+                    )
+                    latest_success_rows[source_key] = cursor.fetchone()
+                cursor.execute(
+                    """
+                    SELECT source, COUNT(*) as total_count
+                    FROM hoaxes
+                    GROUP BY source
+                    """,
+                )
+                for row in list_from_rows(cursor.fetchall()):
+                    scraper_totals_by_source[row["source"]] = int(row.get("total_count") or 0)
             finally:
                 conn.close()
         except Exception:
             db_rows = {}
+            latest_success_rows = {}
+            scraper_totals_by_source = {}
+
+        try:
+            api_conn = get_connection()
+            api_cursor = api_conn.cursor()
+            source_names = list(SCRAPER_SOURCE_NAMES)
+            if source_names:
+                placeholders = ", ".join("?" for _ in source_names)
+                api_cursor.execute(
+                    f"""
+                    SELECT source, COUNT(*) as total_count
+                    FROM news
+                    WHERE source IN ({placeholders})
+                    GROUP BY source
+                    """,
+                    tuple(source_names),
+                )
+                for row in list_from_rows(api_cursor.fetchall()):
+                    news_totals_by_source[row["source"]] = int(row.get("total_count") or 0)
+        except Exception:
+            news_totals_by_source = {}
+        finally:
+            try:
+                api_conn.close()
+            except Exception:
+                pass
 
         for source_key, source_name in ALL_SCRAPER_SOURCES.items():
             worker = self.source_workers.get(source_key, {})
             row = db_rows.get(source_key)
+            success_row = latest_success_rows.get(source_key)
             available = source_key in SCRAPER_SOURCES
             metrics.append(
                 {
@@ -526,11 +714,16 @@ class ScrapingManager:
                     "available": available,
                     "is_running": worker.get("is_running", False),
                     "interval_seconds": worker.get("interval_seconds", 300),
+                    "max_runtime_seconds": worker.get("max_runtime_seconds", MAX_SCRAPER_RUNTIME_SECONDS),
                     "started_at": worker.get("started_at"),
                     "loop_last_run_at": worker.get("last_run_at"),
                     "last_run_time": row["run_time"] if row else None,
                     "last_status": row["status"] if row else ("UNAVAILABLE" if not available else "N/A"),
                     "last_collected": row["articles_collected"] if row else 0,
+                    "last_success_run_time": success_row["run_time"] if success_row else None,
+                    "last_success_collected": success_row["articles_collected"] if success_row else 0,
+                    "scraper_total_articles": scraper_totals_by_source.get(source_name, 0),
+                    "total_articles": news_totals_by_source.get(source_name, 0),
                 }
             )
 
@@ -542,6 +735,7 @@ class ScrapingManager:
         return {
             "is_running": running,
             "interval_seconds": self.interval_seconds,
+            "max_runtime_seconds": self.max_runtime_seconds,
             "started_at": self.started_at,
             "last_run_at": self.last_run_at,
             "last_summary": self.last_summary,
@@ -762,21 +956,27 @@ def analyze_text():
         
         text = data.get("text", "").strip()
         
-        if len(text) < 20:
-            return error_response("Text must be at least 20 characters", 400)
+        if len(text) < int(MIN_TEXT_LENGTH):
+            return error_response(f"Text must be at least {int(MIN_TEXT_LENGTH)} characters", 400)
         
-        # Run classifier
         prediction, confidence = classify_article(text)
-        
+        effective_category = (data.get("category") or "").strip() or detect_primary_category(text)
+        if confidence < float(CONFIDENCE_THRESHOLD):
+            # Keep the prediction, but make low-confidence state explicit to callers.
+            analysis_note = "low_confidence"
+        else:
+            analysis_note = "ok"
+
         # Prepare data
         new_item = {
             "title": text[:100],  # First 100 chars as title
             "content": text,
             "source": data.get("source", "User Input"),
-            "category": data.get("category", "General"),
+            "category": effective_category or "other",
             "date": datetime.now().strftime("%Y-%m-%d"),
             "prediction": prediction,
-            "confidence": confidence
+            "confidence": confidence,
+            "analysis_note": analysis_note
         }
         
         # Save to database
@@ -785,14 +985,15 @@ def analyze_text():
         
         try:
             cursor.execute("""
-                INSERT INTO news (title, content, source, category, date, prediction, confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO news (title, content, source, category, date, published_at_source, prediction, confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 new_item["title"],
                 new_item["content"],
                 new_item["source"],
                 new_item["category"],
                 new_item["date"],
+                None,
                 new_item["prediction"],
                 new_item["confidence"]
             ))
@@ -829,16 +1030,33 @@ def get_recent_hoaxes():
         conn = get_connection()
         cursor = conn.cursor()
         source_clause, source_params = _source_filter_sql()
+        quality_clause, quality_params = _news_quality_filter_sql()
+
+        event_ts_sql = """
+            COALESCE(
+                CASE
+                    WHEN published_at_source IS NOT NULL AND TRIM(published_at_source) <> ''
+                    THEN REPLACE(SUBSTR(published_at_source, 1, 19), 'T', ' ')
+                END,
+                CASE
+                    WHEN date IS NOT NULL AND TRIM(date) <> ''
+                    THEN date || ' 00:00:00'
+                END,
+                REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ')
+            )
+        """
         
         cursor.execute(f"""
-            SELECT id, title, source, source_url, category, date, prediction, confidence, created_at
+            SELECT id, title, source, source_url, category, date, published_at_source, prediction, confidence, created_at, updated_at
             FROM news 
             WHERE {source_clause}
-            ORDER BY created_at DESC 
+              AND {quality_clause}
+            ORDER BY datetime({event_ts_sql}) DESC, id DESC
             LIMIT ?
-        """, (*source_params, limit))
+        """, (*source_params, *quality_params, max(limit * 5, 50)))
         
-        hoaxes = list_from_rows(cursor.fetchall())
+        hoaxes_raw = _sanitize_news_rows(list_from_rows(cursor.fetchall()))
+        hoaxes = [row for row in hoaxes_raw if _is_displayable_title(row.get("title"))][:limit]
         conn.close()
         
         return success_response(hoaxes)
@@ -852,51 +1070,57 @@ def get_news():
     try:
         page = max(1, int(request.args.get('page', 1)))
         limit = min(100, int(request.args.get('limit', 20)))
-        
+
         offset = (page - 1) * limit
-        
+
         # Filters
         category = request.args.get('category')
         prediction = request.args.get('prediction')
+        source = request.args.get('source', '').strip()
         search = request.args.get('search', '').strip()
-        
+
         conn = get_connection()
         cursor = conn.cursor()
-        
-        # Build query
+
         source_clause, source_params = _source_filter_sql()
-        query = f"SELECT id, title, source, source_url, category, date, prediction, confidence, created_at FROM news WHERE {source_clause}"
-        params = list(source_params)
-        
+        quality_clause, quality_params = _news_quality_filter_sql()
+
+        where_clauses = [source_clause, quality_clause]
+        params = list(source_params) + list(quality_params)
+
         if category:
-            query += " AND category = ?"
+            where_clauses.append("category = ?")
             params.append(category)
-        
+
         if prediction:
-            query += " AND prediction = ?"
+            where_clauses.append("prediction = ?")
             params.append(prediction)
-        
+
+        if source:
+            where_clauses.append("source = ?")
+            params.append(source)
+
         if search:
-            query += " AND (title LIKE ? OR content LIKE ?)"
+            where_clauses.append("(title LIKE ? OR content LIKE ?)")
             search_term = f"%{search}%"
             params.extend([search_term, search_term])
-        
-        # Count total
-        count_query = query.replace(
-            "SELECT id, title, source, source_url, category, date, prediction, confidence, created_at",
-            "SELECT COUNT(*) as count",
-        )
+
+        where_sql = " AND ".join(where_clauses)
+
+        count_query = f"SELECT COUNT(*) as count FROM news WHERE {where_sql}"
         cursor.execute(count_query, params)
         total = cursor.fetchone()['count']
-        
-        # Get paginated results
-        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-        
-        cursor.execute(query, params)
-        news_list = list_from_rows(cursor.fetchall())
+
+        query = (
+            "SELECT id, title, source, source_url, category, date, published_at_source, "
+            "prediction, confidence, created_at, updated_at "
+            f"FROM news WHERE {where_sql} "
+            "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        )
+        cursor.execute(query, params + [limit, offset])
+        news_list = _sanitize_news_rows(list_from_rows(cursor.fetchall()))
         conn.close()
-        
+
         return success_response({
             "items": news_list,
             "pagination": {
@@ -906,7 +1130,7 @@ def get_news():
                 "pages": (total + limit - 1) // limit
             }
         })
-        
+
     except Exception as e:
         return error_response(str(e), 500, traceback.format_exc())
 
@@ -921,7 +1145,7 @@ def get_news_detail(news_id):
             f"SELECT * FROM news WHERE id = ? AND {source_clause}",
             (news_id, *source_params),
         )
-        news = dict_from_row(cursor.fetchone())
+        news = _sanitize_news_row(dict_from_row(cursor.fetchone()))
         conn.close()
         
         if not news:
@@ -941,45 +1165,107 @@ def get_news_detail(news_id):
 def admin_dashboard():
     """Get admin dashboard statistics"""
     try:
+        days = max(1, min(365, int(request.args.get('days', 30))))
         conn = get_connection()
         cursor = conn.cursor()
-        
-        # Get stats
-        cursor.execute("SELECT COUNT(*) as count FROM news")
+
+        source_clause, source_params = _source_filter_sql()
+        range_param = f"-{days} days"
+        event_ts_sql = """
+            COALESCE(
+                CASE
+                    WHEN published_at_source IS NOT NULL AND TRIM(published_at_source) <> ''
+                    THEN REPLACE(SUBSTR(published_at_source, 1, 19), 'T', ' ')
+                END,
+                CASE
+                    WHEN date IS NOT NULL AND TRIM(date) <> ''
+                    THEN date || ' 00:00:00'
+                END,
+                REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ')
+            )
+        """
+
+        # Get stats (aligned with visualization source/time filters)
+        cursor.execute(
+            f"""
+            SELECT COUNT(*) as count
+            FROM news
+            WHERE {source_clause}
+              AND datetime({event_ts_sql}) >= datetime('now', ?)
+            """,
+            (*source_params, range_param),
+        )
         total_news = cursor.fetchone()['count']
-        
-        cursor.execute("SELECT COUNT(*) as count FROM news WHERE prediction = 'Hoax'")
+
+        cursor.execute(
+            f"""
+            SELECT COUNT(*) as count
+            FROM news
+            WHERE {source_clause}
+              AND prediction = 'Hoax'
+              AND datetime({event_ts_sql}) >= datetime('now', ?)
+            """,
+            (*source_params, range_param),
+        )
         hoax_count = cursor.fetchone()['count']
-        
-        cursor.execute("SELECT COUNT(*) as count FROM news WHERE prediction = 'Legitimate'")
+
+        cursor.execute(
+            f"""
+            SELECT COUNT(*) as count
+            FROM news
+            WHERE {source_clause}
+              AND prediction = 'Legitimate'
+              AND datetime({event_ts_sql}) >= datetime('now', ?)
+            """,
+            (*source_params, range_param),
+        )
         legit_count = cursor.fetchone()['count']
-        
+
         cursor.execute("SELECT COUNT(*) as count FROM users WHERE role = 'user'")
         user_count = cursor.fetchone()['count']
-        
-        cursor.execute("SELECT AVG(confidence) as avg_confidence FROM news")
+
+        cursor.execute(
+            f"""
+            SELECT AVG(confidence) as avg_confidence
+            FROM news
+            WHERE {source_clause}
+              AND datetime({event_ts_sql}) >= datetime('now', ?)
+            """,
+            (*source_params, range_param),
+        )
         avg_confidence = cursor.fetchone()['avg_confidence'] or 0
-        
+
         # Get recent news
-        cursor.execute("""
-            SELECT id, title, prediction, confidence, date 
-            FROM news 
-            ORDER BY date DESC 
-            LIMIT 10
-        """)
-        recent = list_from_rows(cursor.fetchall())
-        
+        cursor.execute(
+            f"""
+            SELECT id, title, prediction, confidence, date, published_at_source, source, created_at, updated_at
+            FROM news
+            WHERE {source_clause}
+              AND datetime({event_ts_sql}) >= datetime('now', ?)
+            ORDER BY datetime({event_ts_sql}) DESC, id DESC
+            LIMIT 50
+            """,
+            (*source_params, range_param),
+        )
+        recent_raw = _sanitize_news_rows(list_from_rows(cursor.fetchall()))
+        recent = [row for row in recent_raw if _is_displayable_title(row.get("title"))][:10]
+
         # Category distribution
-        cursor.execute("""
+        cursor.execute(
+            f"""
             SELECT category, COUNT(*) as count, AVG(confidence) as avg_conf
             FROM news
+            WHERE {source_clause}
+              AND datetime({event_ts_sql}) >= datetime('now', ?)
             GROUP BY category
             ORDER BY count DESC
-        """)
+            """,
+            (*source_params, range_param),
+        )
         categories = list_from_rows(cursor.fetchall())
-        
+
         conn.close()
-        
+
         return success_response({
             "statistics": {
                 "total_news": total_news,
@@ -990,7 +1276,8 @@ def admin_dashboard():
                 "hoax_percentage": round((hoax_count / max(1, total_news)) * 100, 2)
             },
             "recent_news": recent,
-            "category_distribution": categories
+            "category_distribution": categories,
+            "period_days": days,
         })
         
     except Exception as e:
@@ -1021,6 +1308,9 @@ def admin_start_scraping():
     try:
         data = request.get_json() or {}
         interval_seconds = int(data.get("interval_seconds", 300))
+        requested_runtime = int(data.get("max_runtime_seconds", MAX_SCRAPER_RUNTIME_SECONDS))
+        max_runtime_seconds = min(MAX_SCRAPER_RUNTIME_SECONDS, max(60, requested_runtime))
+        scraping_manager.max_runtime_seconds = max_runtime_seconds
         started = scraping_manager.start(interval_seconds)
         if not started:
             return error_response("No available sources started (already running or unavailable)", 400)
@@ -1028,7 +1318,10 @@ def admin_start_scraping():
         record_admin_action(
             request.current_user['user_id'],
             "START_SCRAPING",
-            f"Started scraping loop with interval {scraping_manager.interval_seconds}s",
+            (
+                f"Started scraping loop interval={scraping_manager.interval_seconds}s "
+                f"auto_stop={scraping_manager.max_runtime_seconds}s"
+            ),
         )
         return success_response(scraping_manager.status(), "Scraping started")
     except Exception as e:
@@ -1088,14 +1381,19 @@ def admin_start_single_source_loop(source_key):
     try:
         data = request.get_json() or {}
         interval_seconds = int(data.get("interval_seconds", 300))
-        started = scraping_manager.start_source(source_key, interval_seconds)
+        requested_runtime = int(data.get("max_runtime_seconds", MAX_SCRAPER_RUNTIME_SECONDS))
+        max_runtime_seconds = min(MAX_SCRAPER_RUNTIME_SECONDS, max(60, requested_runtime))
+        started = scraping_manager.start_source(source_key, interval_seconds, max_runtime_seconds)
         if not started:
             return error_response("Source scraper is already running", 400)
 
         record_admin_action(
             request.current_user['user_id'],
             "START_SOURCE_SCRAPER_LOOP",
-            f"Started source {source_key} loop interval {interval_seconds}s",
+            (
+                f"Started source {source_key} loop interval={interval_seconds}s "
+                f"auto_stop={max_runtime_seconds}s"
+            ),
         )
         return success_response(scraping_manager.status(), "Source scraper started")
     except ValueError as e:
@@ -1369,6 +1667,72 @@ def admin_change_user_role(user_id):
         return error_response(str(e), 500)
 
 
+@app.route("/api/admin/users/<int:user_id>/status", methods=["PUT"])
+@admin_required
+def admin_change_user_status(user_id):
+    """Activate/deactivate user account (admin only)"""
+    try:
+        data = request.get_json() or {}
+        is_active_raw = data.get("is_active")
+
+        if isinstance(is_active_raw, bool):
+            new_status = 1 if is_active_raw else 0
+        elif isinstance(is_active_raw, int) and is_active_raw in (0, 1):
+            new_status = int(is_active_raw)
+        else:
+            return error_response("Invalid status value. Use true/false.", 400)
+
+        if user_id == request.current_user["user_id"] and new_status == 0:
+            return error_response("Admin cannot deactivate own account", 400)
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT id, username, role, is_active FROM users WHERE id = ?", (user_id,))
+        target_user = cursor.fetchone()
+        if not target_user:
+            conn.close()
+            return error_response("User not found", 404)
+
+        target_username = target_user["username"]
+        target_role = target_user["role"]
+        current_status = int(target_user["is_active"] or 0)
+        requester_is_super = _current_user_is_super_admin()
+
+        if _is_super_admin_username(target_username):
+            conn.close()
+            return error_response("Super admin account status cannot be changed", 403)
+
+        # Only super admin can manage admin account status.
+        if not requester_is_super and target_role == "admin":
+            conn.close()
+            return error_response("Only super admin can manage admin account status", 403)
+
+        if current_status == new_status:
+            conn.close()
+            return success_response(
+                {"user_id": user_id, "is_active": bool(new_status)},
+                "User status unchanged",
+            )
+
+        cursor.execute("UPDATE users SET is_active = ? WHERE id = ?", (new_status, user_id))
+        conn.commit()
+        conn.close()
+
+        record_admin_action(
+            request.current_user["user_id"],
+            "CHANGE_USER_STATUS",
+            f"Changed user {user_id} ({target_username}) status from {current_status} to {new_status}",
+        )
+
+        return success_response(
+            {"user_id": user_id, "is_active": bool(new_status)},
+            "User status updated",
+        )
+    except Exception as e:
+        return error_response(str(e), 500, traceback.format_exc())
+
+
 @app.route("/api/password-reset-tickets", methods=["POST"])
 def create_password_reset_ticket():
     """Public endpoint for submitting password reset support tickets."""
@@ -1483,6 +1847,90 @@ def admin_delete_user(user_id):
     except Exception as e:
         return error_response(str(e), 500, traceback.format_exc())
 
+
+@app.route("/api/admin/hoax-analytics", methods=["POST"])
+@admin_required
+def admin_add_hoax_analytics():
+    """Add a manual hoax analytics entry"""
+    try:
+        data = request.get_json() or {}
+        title = (data.get("title") or "").strip()
+        source = (data.get("source") or "").strip()
+        article = (data.get("article") or "").strip()
+        source_url = (data.get("source_url") or "").strip()
+        category = (data.get("category") or "Admin Analytics").strip() or "Admin Analytics"
+        published_date = (data.get("published_date") or "").strip()
+        confidence_raw = data.get("confidence", 1.0)
+
+        if len(title) < 10:
+            return error_response("Title must be at least 10 characters", 400)
+        if len(source) < 2:
+            return error_response("Source is required", 400)
+
+        if article and len(article) < 20:
+            return error_response("Article content must be at least 20 characters when provided", 400)
+
+        date_value = datetime.now().strftime("%Y-%m-%d")
+        if published_date:
+            try:
+                date_value = datetime.strptime(published_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+            except ValueError:
+                return error_response("published_date must use YYYY-MM-DD format", 400)
+
+        try:
+            confidence = float(confidence_raw)
+        except (TypeError, ValueError):
+            return error_response("confidence must be a number between 0 and 1", 400)
+
+        confidence = max(0.0, min(1.0, confidence))
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO news (title, content, source, source_url, category, date, published_at_source, prediction, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'Hoax', ?)
+            """,
+            (
+                title,
+                article or None,
+                source,
+                source_url or None,
+                category,
+                date_value,
+                f"{date_value}T00:00:00",
+                confidence,
+            ),
+        )
+        news_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+
+        record_admin_action(
+            request.current_user["user_id"],
+            "ADD_HOAX_ANALYTICS",
+            f"Added hoax analytics entry {news_id} from source {source}",
+        )
+
+        return success_response(
+            {
+                "id": news_id,
+                "title": title,
+                "source": source,
+                "source_url": source_url or None,
+                "article": article or None,
+                "category": category,
+                "date": date_value,
+                "published_at_source": f"{date_value}T00:00:00",
+                "prediction": "Hoax",
+                "confidence": confidence,
+            },
+            "Hoax analytics entry added",
+            201,
+        )
+    except Exception as e:
+        return error_response(str(e), 500, traceback.format_exc())
+
 # ===============================
 # USER ROUTES
 # ===============================
@@ -1589,62 +2037,126 @@ def statistics_recent():
     """Get recent statistics with trend data"""
     try:
         days = max(1, min(365, int(request.args.get('days', 7))))
-        
+
         conn = get_connection()
         cursor = conn.cursor()
-        
-        # Get daily statistics for trending
-        cursor.execute(f"""
-            SELECT 
-                date,
+
+        source_placeholders = ", ".join("?" for _ in SCRAPER_SOURCE_NAMES)
+        source_params = list(SCRAPER_SOURCE_NAMES)
+        range_param = f"-{days} days"
+        event_ts_sql = """
+            COALESCE(
+                CASE
+                    WHEN published_at_source IS NOT NULL AND TRIM(published_at_source) <> ''
+                    THEN REPLACE(SUBSTR(published_at_source, 1, 19), 'T', ' ')
+                END,
+                CASE
+                    WHEN date IS NOT NULL AND TRIM(date) <> ''
+                    THEN date || ' 00:00:00'
+                END,
+                REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ')
+            )
+        """
+
+        # Get daily statistics for trending.
+        cursor.execute(
+            f"""
+            SELECT
+                date(datetime({event_ts_sql})) as date,
                 prediction,
                 COUNT(*) as count
             FROM news
-            WHERE date >= datetime('now', '-{days} days')
-            GROUP BY date, prediction
-            ORDER BY date DESC
-        """)
+            WHERE source IN ({source_placeholders})
+              AND datetime({event_ts_sql}) >= datetime('now', ?)
+            GROUP BY date(datetime({event_ts_sql})), prediction
+            ORDER BY date(datetime({event_ts_sql})) DESC
+            """,
+            (*source_params, range_param),
+        )
         daily_stats = list_from_rows(cursor.fetchall())
-        
-        # Aggregate by prediction
-        cursor.execute(f"""
-            SELECT 
+
+        # Aggregate by prediction.
+        cursor.execute(
+            f"""
+            SELECT
                 prediction,
                 COUNT(*) as count,
                 AVG(confidence) as avg_confidence
             FROM news
-            WHERE date >= datetime('now', '-{days} days')
+            WHERE source IN ({source_placeholders})
+              AND datetime({event_ts_sql}) >= datetime('now', ?)
             GROUP BY prediction
-        """)
+            """,
+            (*source_params, range_param),
+        )
         prediction_stats = list_from_rows(cursor.fetchall())
-        
-        # Category distribution
-        cursor.execute(f"""
-            SELECT 
+
+        # Category distribution.
+        cursor.execute(
+            f"""
+            SELECT
                 category,
                 COUNT(*) as count,
                 AVG(confidence) as avg_confidence
             FROM news
-            WHERE date >= datetime('now', '-{days} days')
+            WHERE source IN ({source_placeholders})
+              AND datetime({event_ts_sql}) >= datetime('now', ?)
             GROUP BY category
             ORDER BY count DESC
-        """)
+            """,
+            (*source_params, range_param),
+        )
         category_stats = list_from_rows(cursor.fetchall())
-        
-        # Total statistics
-        cursor.execute(f"""
-            SELECT 
+
+        # Source distribution for charts.
+        cursor.execute(
+            f"""
+            SELECT
+                source,
+                COUNT(*) as total_count,
+                SUM(CASE WHEN prediction = 'Hoax' THEN 1 ELSE 0 END) as hoax_count,
+                SUM(CASE WHEN prediction = 'Legitimate' THEN 1 ELSE 0 END) as legitimate_count,
+                AVG(confidence) as avg_confidence
+            FROM news
+            WHERE source IN ({source_placeholders})
+              AND datetime({event_ts_sql}) >= datetime('now', ?)
+            GROUP BY source
+            ORDER BY total_count DESC
+            """,
+            (*source_params, range_param),
+        )
+        source_rows = {row["source"]: row for row in list_from_rows(cursor.fetchall())}
+        source_stats = []
+        for source_name in SCRAPER_SOURCE_NAMES:
+            row = source_rows.get(source_name, {})
+            source_stats.append(
+                {
+                    "source": source_name,
+                    "total_count": row.get("total_count", 0) or 0,
+                    "hoax_count": row.get("hoax_count", 0) or 0,
+                    "legitimate_count": row.get("legitimate_count", 0) or 0,
+                    "avg_confidence": float(row.get("avg_confidence") or 0),
+                }
+            )
+
+        # Total statistics.
+        cursor.execute(
+            f"""
+            SELECT
                 COUNT(*) as total,
                 SUM(CASE WHEN prediction = 'Hoax' THEN 1 ELSE 0 END) as hoax_count,
                 SUM(CASE WHEN prediction = 'Legitimate' THEN 1 ELSE 0 END) as legitimate_count,
                 AVG(confidence) as avg_confidence
             FROM news
-            WHERE date >= datetime('now', '-{days} days')
-        """)
+            WHERE source IN ({source_placeholders})
+              AND datetime({event_ts_sql}) >= datetime('now', ?)
+            """,
+            (*source_params, range_param),
+        )
         totals = dict_from_row(cursor.fetchone())
-        
+
         conn.close()
-        
+
         return success_response({
             "totals": {
                 "total_articles": totals['total'] or 0,
@@ -1655,10 +2167,11 @@ def statistics_recent():
             },
             "predictions": prediction_stats,
             "categories": category_stats,
+            "sources": source_stats,
             "daily_trend": daily_stats,
             "period_days": days
         })
-        
+
     except Exception as e:
         return error_response(str(e), 500)
 

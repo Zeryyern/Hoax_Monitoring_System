@@ -193,10 +193,16 @@ def create_user(username: str, email: str, password: str, role: str = 'user') ->
         return False, None, "Password must be at least 8 characters"
     
     # Check if user already exists
-    if get_user_by_email(email):
+    existing_email = get_user_by_email(email)
+    if existing_email:
+        if not existing_email.get("is_active"):
+            return False, None, "This account is inactive. Please contact an admin."
         return False, None, "Email already registered"
-    
-    if get_user_by_username(username):
+
+    existing_username = get_user_by_username(username)
+    if existing_username:
+        if not existing_username.get("is_active"):
+            return False, None, "This username belongs to an inactive account. Please contact an admin."
         return False, None, "Username already taken"
     
     # Create user

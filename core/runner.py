@@ -34,9 +34,18 @@ def run_once():
 
         # Save to DB
         inserted = save_articles(articles)
+        inserted_news = 0
+        try:
+            # Keep the API/UI in sync: persist scraped items into the `news` table
+            # (used by dashboards/statistics), not only the scraper `hoaxes` table.
+            from api import _persist_scraped_to_news  # local import to avoid startup coupling
+            inserted_news = _persist_scraped_to_news(articles)
+        except Exception as e:
+            logger.warning(f"Unable to persist scraped items into news table: {type(e).__name__}: {e}")
 
         logger.info(f"TOTAL ARTICLES COLLECTED: {total}")
         logger.info(f"NEW ARTICLES INSERTED INTO DB: {inserted}")
+        logger.info(f"NEW ARTICLES INSERTED INTO NEWS: {inserted_news}")
 
         # Log system run
         log_run(total, inserted, "SUCCESS")

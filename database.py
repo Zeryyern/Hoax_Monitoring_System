@@ -49,6 +49,7 @@ def init_db():
             source_url TEXT,
             category TEXT,
             date TEXT,
+            published_at_source TEXT,
             prediction TEXT CHECK(prediction IN ('Hoax', 'Legitimate')),
             confidence REAL DEFAULT 0.0 CHECK(confidence >= 0.0 AND confidence <= 1.0),
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -117,8 +118,15 @@ def init_db():
             "ALTER TABLE password_reset_tickets ADD COLUMN admin_unique_id TEXT"
         )
 
+    # Add missing columns for existing news table.
+    cursor.execute("PRAGMA table_info(news)")
+    news_columns = {row[1] for row in cursor.fetchall()}
+    if "published_at_source" not in news_columns:
+        cursor.execute("ALTER TABLE news ADD COLUMN published_at_source TEXT")
+
     # Create indices for better performance
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_news_date ON news(date)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_news_published_at_source ON news(published_at_source)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_news_category ON news(category)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_news_prediction ON news(prediction)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_analysis_user ON user_analysis(user_id)")

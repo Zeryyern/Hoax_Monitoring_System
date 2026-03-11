@@ -7,7 +7,7 @@ from storage.storage import (
 from analysis.text_cleaner import clean_text
 from analysis.nlp_processor import process_text
 from analysis.keyword_extractor import extract_keywords
-from analysis.classifier import classify_article
+from analysis.classifier import classify_article, detect_primary_category
 
 def extract_main_text(url: str) -> str:
     try:
@@ -50,8 +50,10 @@ def process_articles(limit: int = 10):
             
             word_count = len(tokens)
             unique_word_count = len(set(tokens))
-            category = classify_article(cleaned_content)
+            prediction, confidence = classify_article(cleaned_content)
+            category = detect_primary_category(cleaned_content)
             print(f"[NLP] Category: {category}")
+            print(f"[NLP] Prediction: {prediction} ({round(confidence * 100, 1)}%)")
             print(f"[NLP] Word Count: {word_count}")
             print(f"[NLP] Unique words: {unique_word_count}")
             print(f"[NLP] Keywords: {keywords[:5]}")
