@@ -53,7 +53,8 @@ def init_db():
             prediction TEXT CHECK(prediction IN ('Hoax', 'Legitimate')),
             confidence REAL DEFAULT 0.0 CHECK(confidence >= 0.0 AND confidence <= 1.0),
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            claim_key TEXT
         )
     """)
 
@@ -107,6 +108,11 @@ def init_db():
     """)
 
     # Add missing columns for existing databases.
+    cursor.execute("PRAGMA table_info(news)")
+    news_columns = {row[1] for row in cursor.fetchall()}
+    if "claim_key" not in news_columns:
+        cursor.execute("ALTER TABLE news ADD COLUMN claim_key TEXT")
+
     cursor.execute("PRAGMA table_info(password_reset_tickets)")
     ticket_columns = {row[1] for row in cursor.fetchall()}
     if "ticket_type" not in ticket_columns:
@@ -129,6 +135,7 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_news_published_at_source ON news(published_at_source)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_news_category ON news(category)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_news_prediction ON news(prediction)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_news_claim_key ON news(claim_key)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_analysis_user ON user_analysis(user_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_analysis_news ON user_analysis(news_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_admin_logs_admin ON admin_logs(admin_id)")
@@ -137,6 +144,55 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_reset_tickets_email ON password_reset_tickets(email)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_reset_tickets_created_at ON password_reset_tickets(created_at)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_reset_tickets_type ON password_reset_tickets(ticket_type)")
+
+    # ===============================
+    # FULL-TEXT SEARCH (Best-Effort)
+    # ===============================
+    # SQLite builds may or may not include FTS5. This is best-effort and silently
+    # degrades to LIKE-based search if unavailable.
+    try:
+        cursor.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS news_fts USING fts5(
+                title,
+                claim_key,
+                source_url,
+                content='news',
+                content_rowid='id',
+                tokenize='unicode61'
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS news_ai AFTER INSERT ON news BEGIN
+              INSERT INTO news_fts(rowid, title, claim_key, source_url)
+              VALUES (new.id, new.title, new.claim_key, new.source_url);
+            END;
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS news_ad AFTER DELETE ON news BEGIN
+              INSERT INTO news_fts(news_fts, rowid, title, claim_key, source_url)
+              VALUES('delete', old.id, old.title, old.claim_key, old.source_url);
+            END;
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS news_au AFTER UPDATE ON news BEGIN
+              INSERT INTO news_fts(news_fts, rowid, title, claim_key, source_url)
+              VALUES('delete', old.id, old.title, old.claim_key, old.source_url);
+              INSERT INTO news_fts(rowid, title, claim_key, source_url)
+              VALUES (new.id, new.title, new.claim_key, new.source_url);
+            END;
+            """
+        )
+        # Ensure existing rows are indexed.
+        cursor.execute("INSERT INTO news_fts(news_fts) VALUES('rebuild')")
+    except Exception:
+        pass
 
     conn.commit()
     conn.close()

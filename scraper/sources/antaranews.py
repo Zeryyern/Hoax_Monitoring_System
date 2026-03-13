@@ -28,6 +28,9 @@ def scrape_antaranews(pages=None, max_pages=100000):
     current_url = f"{BASE_URL}?page=1"
     visited_listing_urls = set()
     consecutive_empty_pages = 0
+    listing_attempts = 0
+    listing_failures = 0
+    last_error = None
 
     if pages is None:
         robots_seeds = discover_sitemaps_from_robots(
@@ -73,6 +76,7 @@ def scrape_antaranews(pages=None, max_pages=100000):
         visited_listing_urls.add(current_url)
 
         try:
+            listing_attempts += 1
             r = session.get(current_url, timeout=20)
             print(f"STATUS page {page}: {r.status_code}")
 
@@ -137,15 +141,23 @@ def scrape_antaranews(pages=None, max_pages=100000):
                 current_url = next_url or f"{BASE_URL}?page={page}"
 
         except RequestException:
+            listing_failures += 1
+            last_error = "RequestException"
             # If main page request fails, skip to next page
             page += 1
             current_url = f"{BASE_URL}?page={page}"
             continue
         except Exception:
+            listing_failures += 1
+            last_error = "Exception"
             # Catch any unexpected errors and continue
             page += 1
             current_url = f"{BASE_URL}?page={page}"
             continue
+
+    # If we couldn't fetch any listing pages and sitemap mode wasn't used, surface it as an error.
+    if pages is not None and listing_attempts > 0 and listing_failures >= listing_attempts and not results:
+        raise RuntimeError(f"Antara listing fetch failed (attempts={listing_attempts}, failures={listing_failures}, last={last_error})")
 
     return results
 

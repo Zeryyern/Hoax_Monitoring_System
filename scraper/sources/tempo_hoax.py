@@ -17,10 +17,12 @@ from scraper.utils import (
 )
 
 SOURCE_NAME = "Tempo Hoax"
-BASE_URL = "https://cekfakta.tempo.co/"
+BASE_URL = "https://www.tempo.co/cekfakta/"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
+    "Connection": "keep-alive"
 }
 
 
@@ -31,13 +33,13 @@ def title_from_url(url: str) -> str:
 
 def is_tempo_article_url(url: str) -> bool:
     """
-    Keep only article detail URLs from cekfakta.tempo.co:
-    https://cekfakta.tempo.co/<section>/<slug>-<numeric_id>
+    Keep only article detail URLs from www.tempo.co/cekfakta:
+    https://www.tempo.co/cekfakta/<slug>
     """
     if not url:
         return False
     normalized = url.strip().lower()
-    pattern = re.compile(r"^https?://cekfakta\.tempo\.co/[a-z0-9-]+/[a-z0-9-]+-\d+/?$")
+    pattern = re.compile(r"^https?://www\.tempo\.co/cekfakta/[a-z0-9-]+/?$")
     return bool(pattern.match(normalized))
 
 
@@ -54,15 +56,15 @@ def scrape_tempo_hoax(pages=None, max_pages=100000):
 
     if pages is None:
         robots_seeds = discover_sitemaps_from_robots(
-            "https://cekfakta.tempo.co/robots.txt",
+            "https://www.tempo.co/robots.txt",
             session=session,
             required_domain="tempo.co",
         )
         sitemap_entries = collect_entries_from_sitemaps(
             robots_seeds + [
-                "https://cekfakta.tempo.co/sitemap.xml",
-                "https://cekfakta.tempo.co/sitemap_index.xml",
-                "https://cekfakta.tempo.co/post-sitemap.xml",
+                "https://www.tempo.co/sitemap.xml",
+                "https://www.tempo.co/sitemap_index.xml",
+                "https://www.tempo.co/cekfakta-sitemap.xml",
             ],
             session=session,
             required_domain="tempo.co",
@@ -111,10 +113,10 @@ def scrape_tempo_hoax(pages=None, max_pages=100000):
             title = a.get_text(strip=True)
 
             if href.startswith("/"):
-                href = "https://cekfakta.tempo.co" + href
+                href = "https://www.tempo.co" + href
 
             # after url normalization and before storing, check validity
-            # Accept tempo.co and its subdomains (en.tempo.co, cekfakta.tempo.co)
+            # Accept tempo.co and its subdomains
             if not is_valid_article_url(href, "tempo.co"):
                 continue
             if not is_tempo_article_url(href):

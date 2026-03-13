@@ -46,6 +46,9 @@ def scrape_turnbackhoax(pages=None, max_pages=100000):
     current_url = listing_url(1)
     visited_listing_urls = set()
     consecutive_empty_pages = 0
+    listing_attempts = 0
+    listing_failures = 0
+    last_exception = None
 
     if pages is None:
         robots_seeds = discover_sitemaps_from_robots(
@@ -90,10 +93,13 @@ def scrape_turnbackhoax(pages=None, max_pages=100000):
         visited_listing_urls.add(current_url)
 
         try:
+            listing_attempts += 1
             response = session.get(current_url, timeout=20)
             print(f"STATUS page {page}: {response.status_code}")
         except Exception as e:
             print("Request failed:", e)
+            listing_failures += 1
+            last_exception = e
             page += 1
             current_url = listing_url(page)
             continue
@@ -152,6 +158,11 @@ def scrape_turnbackhoax(pages=None, max_pages=100000):
 
         page += 1
         current_url = listing_url(page)
+
+    # If we tried listing pages but every request failed and we collected nothing,
+    # treat it as an error so callers can mark the source unhealthy.
+    if pages is not None and listing_attempts > 0 and listing_failures >= listing_attempts and not articles:
+        raise RuntimeError(f"TurnBackHoax listing fetch failed (attempts={listing_attempts}, failures={listing_failures}, last={last_exception})")
 
     return articles
 

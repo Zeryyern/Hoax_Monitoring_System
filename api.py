@@ -36,9 +36,22 @@ import traceback
 from typing import Optional
 import hmac
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SCRAPER_IMPORT_ERROR = None
 STORAGE_IMPORT_ERROR = None
+CLAIM_KEY_IMPORT_ERROR = None
+
+try:
+    from claim_key import compute_claim_key, infer_prediction_from_title
+except Exception as e:
+    CLAIM_KEY_IMPORT_ERROR = str(e)
+
+    def compute_claim_key(title: str) -> str:
+        return ""
+
+    def infer_prediction_from_title(title: str) -> str | None:
+        return None
 
 try:
     from scraper.utils import clean_scraped_title
@@ -48,6 +61,7 @@ except Exception:
 
 try:
     from scraper.fetch import safe_run, normalize_and_filter, enrich_missing_published_at
+    from scraper.fetch import LAST_RUN_ERROR as SCRAPER_LAST_RUN_ERROR
     from scraper.sources.turnbackhoax import scrape_turnbackhoax
     from scraper.sources.antaranews import scrape_antaranews
     from scraper.sources.kompas_cekfakta import scrape_kompas_cekfakta
@@ -58,6 +72,7 @@ except Exception as e:
     safe_run = None
     normalize_and_filter = None
     enrich_missing_published_at = None
+    SCRAPER_LAST_RUN_ERROR = {}
     scrape_turnbackhoax = None
     scrape_antaranews = None
     scrape_kompas_cekfakta = None
@@ -328,6 +343,10 @@ _BAD_TITLE_EXACT = {
     "home",
     "index",
     "beranda",
+    "artikel headline",
+    "topik pilihan",
+    "artikel terpopuler",
+    "parapuan",
     "403",
     "404",
     "500",
@@ -364,6 +383,23 @@ def _news_quality_filter_sql(table_alias: str = "") -> tuple[str, list[str]]:
         # numeric-only titles (e.g. "363") are never valid headlines
         f" AND NOT ({prefix}title GLOB '[0-9]*' AND {prefix}title NOT GLOB '*[^0-9]*')"
     )
+    # Kompas-specific noise guard: hide navigation/footer pages even if title isn't caught.
+    clause += (
+        f" AND NOT (LOWER(TRIM({prefix}source)) LIKE '%kompas%' AND ("
+        f" {prefix}source_url LIKE 'https://indeks.kompas.com/%'"
+        f" OR {prefix}source_url LIKE 'https://www.kompas.com/parapuan%'"
+        f" OR {prefix}source_url LIKE 'https://account.kompas.com/login%'"
+        f" ))"
+    )
+    # Kompas article allowlist (only applies when a URL exists).
+    clause += (
+        f" AND NOT (LOWER(TRIM({prefix}source)) LIKE '%kompas%'"
+        f" AND {prefix}source_url IS NOT NULL AND TRIM({prefix}source_url) <> ''"
+        f" AND NOT ("
+        f"   {prefix}source_url LIKE 'https://www.kompas.com/tren/read/%'"
+        f"   OR {prefix}source_url LIKE 'https://cekfakta.kompas.com/read/%'"
+        f" ))"
+    )
     return clause, bad
 
 
@@ -394,6 +430,8 @@ def _persist_scraped_to_news(items: list[dict]) -> int:
                 # Skip obvious scrape failures (login pages, numeric-only titles, etc.).
                 continue
 
+            claim_key = compute_claim_key(title)
+
             if source_url:
                 cursor.execute(
                     "SELECT id, title, date, published_at_source FROM news WHERE source_url = ? LIMIT 1",
@@ -411,21 +449,30 @@ def _persist_scraped_to_news(items: list[dict]) -> int:
                         cursor.execute(
                             """
                             UPDATE news
-                            SET title = ?, date = ?, published_at_source = ?, updated_at = CURRENT_TIMESTAMP
+                            SET title = ?, claim_key = ?, date = ?, published_at_source = ?, updated_at = CURRENT_TIMESTAMP
                             WHERE id = ?
                             """,
-                            (title, news_date, source_published_at, existing["id"]),
+                            (title, claim_key or None, news_date, source_published_at, existing["id"]),
                         )
                     continue
 
-            prediction, confidence = classify_article(title)
+            provided_prediction = (item.get("prediction") or "").strip()
+            if provided_prediction in ("Hoax", "Legitimate"):
+                prediction, confidence = provided_prediction, 1.0
+            else:
+                inferred = infer_prediction_from_title(title)
+                if inferred:
+                    prediction, confidence = inferred, 1.0
+                else:
+                    prediction, confidence = classify_article(title)
             cursor.execute(
                 """
-                INSERT INTO news (title, content, source, source_url, category, date, published_at_source, prediction, confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO news (title, claim_key, content, source, source_url, category, date, published_at_source, prediction, confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     title,
+                    claim_key or None,
                     None,
                     source,
                     source_url or None,
@@ -461,6 +508,7 @@ class ScrapingManager:
                 "max_runtime_seconds": MAX_SCRAPER_RUNTIME_SECONDS,
                 "started_at": None,
                 "last_run_at": None,
+                "last_error": None,
                 "thread": None,
                 "stop_event": Event(),
             }
@@ -495,9 +543,28 @@ class ScrapingManager:
         self._prepare_storage()
 
         raw = safe_run(scraper_func, source_name)
+        try:
+            self.source_workers[source_key]["last_error"] = (SCRAPER_LAST_RUN_ERROR or {}).get(source_name)
+        except Exception:
+            pass
         cleaned = normalize_and_filter(raw, source_name)
-        if enrich_missing_published_at is not None:
+        # Prefer full enrichment (title/published_at/prediction) when available.
+        try:
+            from scraper.fetch import enrich_from_source_pages as _enrich_from_source_pages
+        except Exception:
+            _enrich_from_source_pages = None
+        if _enrich_from_source_pages is not None:
+            cleaned = _enrich_from_source_pages(cleaned, source_name)
+        elif enrich_missing_published_at is not None:
             cleaned = enrich_missing_published_at(cleaned, source_name)
+
+        # Log usable collected count (normalized/filtered), not raw link count.
+        if raw:
+            try:
+                log_source_run(source_name, "SUCCESS", len(cleaned))
+            except Exception:
+                pass
+
         inserted_scraper = save_articles(cleaned)
         inserted_news = _persist_scraped_to_news(cleaned)
 
@@ -717,6 +784,7 @@ class ScrapingManager:
                     "max_runtime_seconds": worker.get("max_runtime_seconds", MAX_SCRAPER_RUNTIME_SECONDS),
                     "started_at": worker.get("started_at"),
                     "loop_last_run_at": worker.get("last_run_at"),
+                    "last_error": worker.get("last_error"),
                     "last_run_time": row["run_time"] if row else None,
                     "last_status": row["status"] if row else ("UNAVAILABLE" if not available else "N/A"),
                     "last_collected": row["articles_collected"] if row else 0,
@@ -978,6 +1046,7 @@ def analyze_text():
             "confidence": confidence,
             "analysis_note": analysis_note
         }
+        new_item["claim_key"] = compute_claim_key(new_item["title"])
         
         # Save to database
         conn = get_connection()
@@ -985,10 +1054,11 @@ def analyze_text():
         
         try:
             cursor.execute("""
-                INSERT INTO news (title, content, source, category, date, published_at_source, prediction, confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO news (title, claim_key, content, source, category, date, published_at_source, prediction, confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 new_item["title"],
+                new_item["claim_key"] or None,
                 new_item["content"],
                 new_item["source"],
                 new_item["category"],
@@ -1064,6 +1134,414 @@ def get_recent_hoaxes():
     except Exception as e:
         return error_response(str(e), 500, traceback.format_exc())
 
+
+def _row_event_ts_seconds(row: dict) -> float:
+    """
+    Convert a news row into a sortable timestamp (seconds since epoch).
+    Preference: published_at_source -> date -> created_at.
+    """
+    def _parse(dt_value: str | None) -> float | None:
+        if not dt_value:
+            return None
+        try:
+            # stored as ISO like "2026-03-05T21:25:44" or "YYYY-MM-DD HH:MM:SS"
+            s = str(dt_value).replace("T", " ").strip()
+            s = s[:19]
+            return datetime.fromisoformat(s).timestamp()
+        except Exception:
+            return None
+
+    for key in ("published_at_source", "date", "created_at"):
+        ts = _parse(row.get(key))
+        if ts is not None:
+            return ts
+    return 0.0
+
+
+def _consensus_verdict_for_group(group_rows: list[dict]) -> str | None:
+    """
+    Apply supervisor consensus rules to a set of rows belonging to the same claim_key.
+    Returns: "Hoax", "Legitimate", or None.
+    """
+    if not group_rows:
+        return None
+    any_legit = any((r.get("prediction") or "").strip() == "Legitimate" for r in group_rows)
+    if any_legit:
+        return "Legitimate"
+    any_hoax = any((r.get("prediction") or "").strip() == "Hoax" for r in group_rows)
+    if any_hoax:
+        return "Hoax"
+    return None
+
+
+def _compute_consensus_stats(rows: list[dict], days: int) -> dict:
+    """
+    Compute statistics based on distinct claims (claim_key groups) instead of raw rows.
+    """
+    groups: dict[str, dict] = {}
+
+    for row in rows:
+        key = (row.get("claim_key") or "").strip()
+        if not key:
+            key = compute_claim_key(row.get("title") or "")
+        if not key:
+            continue
+
+        bucket = groups.get(key)
+        if not bucket:
+            bucket = {
+                "rows": [],
+                "sources": set(),
+                "latest_row": None,
+                "latest_ts": 0.0,
+            }
+            groups[key] = bucket
+
+        bucket["rows"].append(row)
+        src = (row.get("source") or "").strip()
+        if src:
+            bucket["sources"].add(src)
+
+        ts = _row_event_ts_seconds(row)
+        if ts >= float(bucket["latest_ts"] or 0.0):
+            bucket["latest_ts"] = ts
+            bucket["latest_row"] = row
+
+    # Aggregate outputs matching existing API shapes.
+    total_claims = 0
+    hoax_claims = 0
+    legit_claims = 0
+    confidence_sum = 0.0
+
+    pred_counts: dict[str, dict] = {
+        "Hoax": {"count": 0, "conf_sum": 0.0},
+        "Legitimate": {"count": 0, "conf_sum": 0.0},
+    }
+    category_counts: dict[str, dict] = {}
+    daily_counts: dict[tuple[str, str], int] = {}  # (date, prediction) -> count
+
+    source_agg: dict[str, dict] = {
+        name: {"source": name, "total_count": 0, "hoax_count": 0, "legitimate_count": 0, "conf_sum": 0.0}
+        for name in SCRAPER_SOURCE_NAMES
+    }
+
+    for key, bucket in groups.items():
+        verdict = _consensus_verdict_for_group(bucket["rows"])
+        if verdict not in ("Hoax", "Legitimate"):
+            continue
+
+        total_claims += 1
+        if verdict == "Hoax":
+            hoax_claims += 1
+        else:
+            legit_claims += 1
+
+        # Claim confidence: max confidence among its rows (simple, stable).
+        conf = 0.0
+        try:
+            conf = max(float(r.get("confidence") or 0.0) for r in bucket["rows"])
+        except Exception:
+            conf = 0.0
+
+        confidence_sum += conf
+        pred_counts[verdict]["count"] += 1
+        pred_counts[verdict]["conf_sum"] += conf
+
+        latest_row = bucket.get("latest_row") or {}
+        cat = (latest_row.get("category") or "General").strip() or "General"
+        if cat not in category_counts:
+            category_counts[cat] = {"category": cat, "count": 0, "conf_sum": 0.0}
+        category_counts[cat]["count"] += 1
+        category_counts[cat]["conf_sum"] += conf
+
+        # Daily trend: date of the latest row's event timestamp.
+        date_key = None
+        if latest_row:
+            try:
+                date_key = (latest_row.get("event_date") or "").strip() or None
+            except Exception:
+                date_key = None
+        if not date_key:
+            try:
+                date_key = datetime.utcfromtimestamp(float(bucket["latest_ts"] or 0)).strftime("%Y-%m-%d")
+            except Exception:
+                date_key = None
+        if date_key:
+            daily_counts[(date_key, verdict)] = daily_counts.get((date_key, verdict), 0) + 1
+
+        # Source stats: count distinct claims per source, using final verdict.
+        for src in bucket["sources"]:
+            if src not in source_agg:
+                source_agg[src] = {"source": src, "total_count": 0, "hoax_count": 0, "legitimate_count": 0, "conf_sum": 0.0}
+            source_agg[src]["total_count"] += 1
+            if verdict == "Hoax":
+                source_agg[src]["hoax_count"] += 1
+            else:
+                source_agg[src]["legitimate_count"] += 1
+            source_agg[src]["conf_sum"] += conf
+
+    predictions_out = []
+    for pred in ("Hoax", "Legitimate"):
+        count = pred_counts[pred]["count"]
+        avg_conf = (pred_counts[pred]["conf_sum"] / max(1, count)) if count else 0.0
+        predictions_out.append({"prediction": pred, "count": count, "avg_confidence": avg_conf})
+
+    categories_out = []
+    for cat, data in category_counts.items():
+        avg_conf = (data["conf_sum"] / max(1, data["count"])) if data["count"] else 0.0
+        categories_out.append({"category": cat, "count": data["count"], "avg_confidence": avg_conf})
+    categories_out.sort(key=lambda r: int(r.get("count") or 0), reverse=True)
+
+    daily_out = [{"date": d, "prediction": p, "count": c} for (d, p), c in daily_counts.items()]
+    daily_out.sort(key=lambda r: r["date"], reverse=True)
+
+    sources_out = []
+    for source_name in SCRAPER_SOURCE_NAMES:
+        row = source_agg.get(source_name, {})
+        total = int(row.get("total_count") or 0)
+        avg_conf = (float(row.get("conf_sum") or 0.0) / max(1, total)) if total else 0.0
+        sources_out.append(
+            {
+                "source": source_name,
+                "total_count": total,
+                "hoax_count": int(row.get("hoax_count") or 0),
+                "legitimate_count": int(row.get("legitimate_count") or 0),
+                "avg_confidence": avg_conf,
+            }
+        )
+
+    avg_conf_total = (confidence_sum / max(1, total_claims)) if total_claims else 0.0
+
+    return {
+        "totals": {
+            "total_articles": total_claims,
+            "hoax_count": hoax_claims,
+            "legitimate_count": legit_claims,
+            "avg_confidence": round(float(avg_conf_total), 3),
+            "hoax_percentage": round((hoax_claims / max(1, total_claims)) * 100, 2) if total_claims else 0,
+        },
+        "predictions": predictions_out,
+        "categories": categories_out,
+        "sources": sources_out,
+        "daily_trend": daily_out,
+        "period_days": days,
+    }
+
+
+@app.route("/api/hoax/search", methods=["GET"])
+def search_hoax_claims():
+    """
+    Search and group similar claims across sources, applying supervisor rules:
+    1) Any HOAX -> verdict HOAX
+    2) More sources reporting the same HOAX increases corroboration (%)
+    3) Any FACT/Legitimate -> verdict FACT (overrides)
+    """
+    try:
+        q = (request.args.get("q") or "").strip()
+        if not q:
+            return success_response([])
+
+        # Allow short alphabet queries (e.g. "a"), but avoid pathological 1-char
+        # punctuation-only searches that can match everything.
+        if len(q) == 1 and not q.isalnum():
+            return success_response([])
+
+        group_limit = min(50, int(request.args.get("limit", 10)))
+        per_group = min(20, int(request.args.get("per_group", 5)))
+
+        q_norm = re.sub(r"\s+", " ", q.strip().lower())
+        q_like = f"%{q_norm}%"
+        q_key = compute_claim_key(q)
+        q_key_like = f"%{q_key}%" if q_key else q_like
+
+        # Token search improves matching when punctuation/quotes differ or words are re-ordered.
+        tokens = []
+        if q_key:
+            for tok in q_key.split():
+                tok = tok.strip()
+                if not tok:
+                    continue
+                if len(tok) >= 3 or tok.isdigit():
+                    tokens.append(tok)
+        tokens = tokens[:8]
+        token_clause = ""
+        token_params: list[str] = []
+        if tokens:
+            # Use table alias to stay compatible with the FTS JOIN query below.
+            token_clause = " OR (" + " AND ".join("n.claim_key LIKE ?" for _ in tokens) + ")"
+            token_params = [f"%{t}%" for t in tokens]
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        source_clause_raw, source_params = _source_filter_sql()
+        # Always apply explicit aliases because the FTS path joins two tables that both include "title".
+        source_clause = source_clause_raw.replace("source", "n.source")
+        quality_clause, quality_params = _news_quality_filter_sql("n")
+
+        event_ts_sql = """
+            COALESCE(
+                CASE
+                    WHEN n.published_at_source IS NOT NULL AND TRIM(n.published_at_source) <> ''
+                    THEN REPLACE(SUBSTR(n.published_at_source, 1, 19), 'T', ' ')
+                END,
+                CASE
+                    WHEN n.date IS NOT NULL AND TRIM(n.date) <> ''
+                    THEN n.date || ' 00:00:00'
+                END,
+                REPLACE(SUBSTR(n.created_at, 1, 19), 'T', ' ')
+            )
+        """
+
+        # Prefer FTS when available for robust keyword matching.
+        rows = []
+        try:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='news_fts'")
+            has_fts = cursor.fetchone() is not None
+        except Exception:
+            has_fts = False
+
+        if has_fts:
+            # FTS is optional; if it fails for any reason, fall back to LIKE.
+            try:
+                # Build an FTS query with prefix matching.
+                fts_tokens = tokens or [t for t in re.split(r"\s+", q_key or q_norm) if t]
+                fts_tokens = [t for t in fts_tokens if len(t) >= 2][:10]
+                # Escape quotes to keep MATCH syntax safe.
+                fts_query = " ".join(f"{t.replace('\"', '')}*" for t in fts_tokens) or q_norm.replace('"', "")
+
+                cursor.execute(
+                    f"""
+                    SELECT n.id, n.title, n.claim_key, n.source, n.source_url, n.category, n.date, n.published_at_source,
+                           n.prediction, n.confidence, n.created_at, n.updated_at
+                    FROM news_fts f
+                    JOIN news n ON n.id = f.rowid
+                    WHERE {source_clause}
+                      AND {quality_clause}
+                      AND news_fts MATCH ?
+                    ORDER BY datetime({event_ts_sql}) DESC, n.id DESC
+                    LIMIT ?
+                    """,
+                    (*source_params, *quality_params, fts_query, 2000),
+                )
+                rows = _sanitize_news_rows(list_from_rows(cursor.fetchall()))
+            except Exception:
+                rows = []
+
+        if not rows:
+            cursor.execute(
+                f"""
+                SELECT n.id, n.title, n.claim_key, n.source, n.source_url, n.category, n.date, n.published_at_source,
+                       n.prediction, n.confidence, n.created_at, n.updated_at
+                FROM news n
+                WHERE {source_clause}
+                  AND {quality_clause}
+                  AND (
+                        LOWER(n.title) LIKE ?
+                     OR LOWER(COALESCE(n.content, '')) LIKE ?
+                     OR LOWER(COALESCE(n.source_url, '')) LIKE ?
+                     OR (n.claim_key IS NOT NULL AND n.claim_key <> '' AND n.claim_key LIKE ?)
+                     {token_clause}
+                  )
+                ORDER BY datetime({event_ts_sql}) DESC, n.id DESC
+                LIMIT ?
+                """,
+                (*source_params, *quality_params, q_like, q_like, q_like, q_key_like, *token_params, 2000),
+            )
+            rows = _sanitize_news_rows(list_from_rows(cursor.fetchall()))
+        conn.close()
+
+        groups: dict[str, dict] = {}
+        for row in rows:
+            title = (row.get("title") or "").strip()
+            if not title or not _is_displayable_title(title):
+                continue
+
+            key = (row.get("claim_key") or "").strip()
+            if not key:
+                key = compute_claim_key(title)
+            if not key:
+                continue
+
+            pred = (row.get("prediction") or "").strip()
+            if pred not in ("Hoax", "Legitimate"):
+                inferred = infer_prediction_from_title(title)
+                if inferred:
+                    pred = inferred
+
+            bucket = groups.get(key)
+            if not bucket:
+                bucket = {
+                    "claim_key": key,
+                    "articles": [],
+                    "sources_hoax": set(),
+                    "sources_fact": set(),
+                    "latest_ts": 0.0,
+                    "representative": None,
+                }
+                groups[key] = bucket
+
+            src = (row.get("source") or "").strip() or "Unknown Source"
+            if pred == "Hoax":
+                bucket["sources_hoax"].add(src)
+            elif pred == "Legitimate":
+                bucket["sources_fact"].add(src)
+
+            ts = _row_event_ts_seconds(row)
+            if ts >= float(bucket["latest_ts"] or 0.0):
+                bucket["latest_ts"] = ts
+                bucket["representative"] = row
+
+            bucket["articles"].append(row)
+
+        results = []
+        for key, bucket in groups.items():
+            sources_hoax = sorted(bucket["sources_hoax"])
+            sources_fact = sorted(bucket["sources_fact"])
+
+            verdict = "Unknown"
+            if sources_fact:
+                verdict = "Fact"
+            elif sources_hoax:
+                verdict = "Hoax"
+
+            # Supervisor rules:
+            # - If any source reports HOAX, verdict is HOAX (treated as 100% HOAX).
+            # - The increasing percentage is represented as "corroboration" across sources.
+            hoax_accuracy = 0
+            corroboration = 0
+            if verdict == "Hoax":
+                hoax_accuracy = 100
+                corroboration = min(100, 40 + (15 * len(sources_hoax)))
+
+            articles_sorted = sorted(
+                bucket["articles"],
+                key=lambda r: (_row_event_ts_seconds(r), int(r.get("id") or 0)),
+                reverse=True,
+            )
+
+            results.append(
+                {
+                    "claim_key": key,
+                    "query": q,
+                    "verdict": verdict,
+                    "hoax_accuracy_percent": hoax_accuracy,
+                    "corroboration_percent": corroboration,
+                    "sources": {
+                        "hoax": sources_hoax,
+                        "fact": sources_fact,
+                        "total_unique": len(set(sources_hoax + sources_fact)),
+                    },
+                    "latest": bucket["representative"],
+                    "articles": articles_sorted[:per_group],
+                }
+            )
+
+        results.sort(key=lambda r: _row_event_ts_seconds(r.get("latest") or {}), reverse=True)
+        return success_response(results[:group_limit])
+
+    except Exception as e:
+        return error_response(str(e), 500, traceback.format_exc())
+
 @app.route("/api/news", methods=["GET"])
 def get_news():
     """Get all news with pagination and filtering"""
@@ -1085,37 +1563,75 @@ def get_news():
         source_clause, source_params = _source_filter_sql()
         quality_clause, quality_params = _news_quality_filter_sql()
 
-        where_clauses = [source_clause, quality_clause]
+        # Use aliases to support optional FTS join.
+        where_clauses = [source_clause.replace("source", "n.source"), quality_clause.replace("title", "n.title").replace("source_url", "n.source_url").replace("source", "n.source")]
         params = list(source_params) + list(quality_params)
 
         if category:
-            where_clauses.append("category = ?")
+            where_clauses.append("n.category = ?")
             params.append(category)
 
         if prediction:
-            where_clauses.append("prediction = ?")
+            where_clauses.append("n.prediction = ?")
             params.append(prediction)
 
         if source:
-            where_clauses.append("source = ?")
+            where_clauses.append("n.source = ?")
             params.append(source)
 
+        # Detect if FTS is available.
+        has_fts = False
+        try:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='news_fts'")
+            has_fts = cursor.fetchone() is not None
+        except Exception:
+            has_fts = False
+
+        join_sql = ""
+        if has_fts:
+            join_sql = "JOIN news_fts f ON f.rowid = n.id"
+
         if search:
-            where_clauses.append("(title LIKE ? OR content LIKE ?)")
-            search_term = f"%{search}%"
-            params.extend([search_term, search_term])
+            q_norm = re.sub(r"\\s+", " ", search.strip().casefold())
+            q_key = compute_claim_key(search)
+            tokens = [t for t in (q_key.split() if q_key else q_norm.split()) if t][:10]
+            fts_query = " ".join(f"{t.replace('\"', '')}*" for t in tokens if len(t) >= 2) or q_norm.replace('"', "")
+
+            if has_fts:
+                # SQLite FTS MATCH requires the real table name (aliases like "f" can break on SQLite).
+                where_clauses.append("news_fts MATCH ?")
+                params.append(fts_query)
+            else:
+                # Fallback LIKE search: title, content, claim_key, and URL.
+                where_clauses.append("(LOWER(n.title) LIKE ? OR LOWER(COALESCE(n.content,'')) LIKE ? OR (n.claim_key IS NOT NULL AND n.claim_key LIKE ?) OR (n.source_url IS NOT NULL AND LOWER(n.source_url) LIKE ?))")
+                like_term = f"%{q_norm}%"
+                key_like = f"%{q_key}%" if q_key else like_term
+                params.extend([like_term, like_term, key_like, like_term])
 
         where_sql = " AND ".join(where_clauses)
 
-        count_query = f"SELECT COUNT(*) as count FROM news WHERE {where_sql}"
+        count_query = f"SELECT COUNT(*) as count FROM news n {join_sql} WHERE {where_sql}"
         cursor.execute(count_query, params)
         total = cursor.fetchone()['count']
 
+        event_ts_sql = """
+            COALESCE(
+                CASE
+                    WHEN n.published_at_source IS NOT NULL AND TRIM(n.published_at_source) <> ''
+                    THEN REPLACE(SUBSTR(n.published_at_source, 1, 19), 'T', ' ')
+                END,
+                CASE
+                    WHEN n.date IS NOT NULL AND TRIM(n.date) <> ''
+                    THEN n.date || ' 00:00:00'
+                END,
+                REPLACE(SUBSTR(n.created_at, 1, 19), 'T', ' ')
+            )
+        """
         query = (
-            "SELECT id, title, source, source_url, category, date, published_at_source, "
-            "prediction, confidence, created_at, updated_at "
-            f"FROM news WHERE {where_sql} "
-            "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+            "SELECT n.id, n.title, n.source, n.source_url, n.category, n.date, n.published_at_source, "
+            "n.prediction, n.confidence, n.created_at, n.updated_at "
+            f"FROM news n {join_sql} WHERE {where_sql} "
+            f"ORDER BY datetime({event_ts_sql}) DESC, n.id DESC LIMIT ? OFFSET ?"
         )
         cursor.execute(query, params + [limit, offset])
         news_list = _sanitize_news_rows(list_from_rows(cursor.fetchall()))
@@ -1170,6 +1686,7 @@ def admin_dashboard():
         cursor = conn.cursor()
 
         source_clause, source_params = _source_filter_sql()
+        quality_clause, quality_params = _news_quality_filter_sql()
         range_param = f"-{days} days"
         event_ts_sql = """
             COALESCE(
@@ -1185,55 +1702,31 @@ def admin_dashboard():
             )
         """
 
-        # Get stats (aligned with visualization source/time filters)
+        # Consensus stats (distinct claims) for admin cards/charts.
         cursor.execute(
             f"""
-            SELECT COUNT(*) as count
+            SELECT
+                id, title, claim_key, source, source_url, category, date, published_at_source,
+                prediction, confidence, created_at, updated_at,
+                date(datetime({event_ts_sql})) as event_date
             FROM news
             WHERE {source_clause}
+              AND {quality_clause}
               AND datetime({event_ts_sql}) >= datetime('now', ?)
+            ORDER BY datetime({event_ts_sql}) DESC, id DESC
             """,
-            (*source_params, range_param),
+            (*source_params, *quality_params, range_param),
         )
-        total_news = cursor.fetchone()['count']
-
-        cursor.execute(
-            f"""
-            SELECT COUNT(*) as count
-            FROM news
-            WHERE {source_clause}
-              AND prediction = 'Hoax'
-              AND datetime({event_ts_sql}) >= datetime('now', ?)
-            """,
-            (*source_params, range_param),
-        )
-        hoax_count = cursor.fetchone()['count']
-
-        cursor.execute(
-            f"""
-            SELECT COUNT(*) as count
-            FROM news
-            WHERE {source_clause}
-              AND prediction = 'Legitimate'
-              AND datetime({event_ts_sql}) >= datetime('now', ?)
-            """,
-            (*source_params, range_param),
-        )
-        legit_count = cursor.fetchone()['count']
+        consensus_rows = _sanitize_news_rows(list_from_rows(cursor.fetchall()))
+        consensus = _compute_consensus_stats(consensus_rows, days)
+        total_news = int(consensus["totals"]["total_articles"] or 0)
+        hoax_count = int(consensus["totals"]["hoax_count"] or 0)
+        legit_count = int(consensus["totals"]["legitimate_count"] or 0)
 
         cursor.execute("SELECT COUNT(*) as count FROM users WHERE role = 'user'")
         user_count = cursor.fetchone()['count']
 
-        cursor.execute(
-            f"""
-            SELECT AVG(confidence) as avg_confidence
-            FROM news
-            WHERE {source_clause}
-              AND datetime({event_ts_sql}) >= datetime('now', ?)
-            """,
-            (*source_params, range_param),
-        )
-        avg_confidence = cursor.fetchone()['avg_confidence'] or 0
+        avg_confidence = float(consensus["totals"].get("avg_confidence") or 0.0)
 
         # Get recent news
         cursor.execute(
@@ -1241,28 +1734,18 @@ def admin_dashboard():
             SELECT id, title, prediction, confidence, date, published_at_source, source, created_at, updated_at
             FROM news
             WHERE {source_clause}
+              AND {quality_clause}
               AND datetime({event_ts_sql}) >= datetime('now', ?)
             ORDER BY datetime({event_ts_sql}) DESC, id DESC
             LIMIT 50
             """,
-            (*source_params, range_param),
+            (*source_params, *quality_params, range_param),
         )
         recent_raw = _sanitize_news_rows(list_from_rows(cursor.fetchall()))
         recent = [row for row in recent_raw if _is_displayable_title(row.get("title"))][:10]
 
         # Category distribution
-        cursor.execute(
-            f"""
-            SELECT category, COUNT(*) as count, AVG(confidence) as avg_conf
-            FROM news
-            WHERE {source_clause}
-              AND datetime({event_ts_sql}) >= datetime('now', ?)
-            GROUP BY category
-            ORDER BY count DESC
-            """,
-            (*source_params, range_param),
-        )
-        categories = list_from_rows(cursor.fetchall())
+        categories = consensus.get("categories") or []
 
         conn.close()
 
@@ -1273,7 +1756,7 @@ def admin_dashboard():
                 "legitimate_count": legit_count,
                 "user_count": user_count,
                 "avg_confidence": round(avg_confidence, 3),
-                "hoax_percentage": round((hoax_count / max(1, total_news)) * 100, 2)
+                "hoax_percentage": round((hoax_count / max(1, total_news)) * 100, 2) if total_news else 0
             },
             "recent_news": recent,
             "category_distribution": categories,
@@ -1884,15 +2367,18 @@ def admin_add_hoax_analytics():
 
         confidence = max(0.0, min(1.0, confidence))
 
+        claim_key = compute_claim_key(title)
+
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO news (title, content, source, source_url, category, date, published_at_source, prediction, confidence)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'Hoax', ?)
+            INSERT INTO news (title, claim_key, content, source, source_url, category, date, published_at_source, prediction, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Hoax', ?)
             """,
             (
                 title,
+                claim_key or None,
                 article or None,
                 source,
                 source_url or None,
@@ -1928,6 +2414,122 @@ def admin_add_hoax_analytics():
             "Hoax analytics entry added",
             201,
         )
+    except Exception as e:
+        return error_response(str(e), 500, traceback.format_exc())
+
+
+@app.route("/api/admin/news/enrich", methods=["POST"])
+@admin_required
+def admin_enrich_recent_news():
+    """
+    Maintenance: re-fetch source pages to correct title/published_at/prediction for stored rows.
+    Useful after firewall/network issues are resolved.
+    """
+    try:
+        payload = request.get_json() or {}
+        days = max(1, min(365, int(payload.get("days", 30))))
+        limit = max(1, min(500, int(payload.get("limit", 200))))
+
+        try:
+            from scraper.fetch import fetch_enrichment_from_source
+        except Exception as e:
+            return error_response(f"Scraper enrichment unavailable: {e}", 400)
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        source_clause, source_params = _source_filter_sql()
+        quality_clause, quality_params = _news_quality_filter_sql()
+        range_param = f"-{days} days"
+        event_ts_sql = """
+            COALESCE(
+                CASE
+                    WHEN published_at_source IS NOT NULL AND TRIM(published_at_source) <> ''
+                    THEN REPLACE(SUBSTR(published_at_source, 1, 19), 'T', ' ')
+                END,
+                CASE
+                    WHEN date IS NOT NULL AND TRIM(date) <> ''
+                    THEN date || ' 00:00:00'
+                END,
+                REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ')
+            )
+        """
+
+        cursor.execute(
+            f"""
+            SELECT id, title, source, source_url, published_at_source, date, prediction, confidence
+            FROM news
+            WHERE {source_clause}
+              AND {quality_clause}
+              AND source_url IS NOT NULL AND TRIM(source_url) <> ''
+              AND datetime({event_ts_sql}) >= datetime('now', ?)
+            ORDER BY datetime({event_ts_sql}) DESC, id DESC
+            LIMIT ?
+            """,
+            (*source_params, *quality_params, range_param, limit),
+        )
+        rows = list_from_rows(cursor.fetchall())
+
+        updated = 0
+        failed = 0
+
+        def work(row: dict) -> tuple[int, dict]:
+            url = (row.get("source_url") or "").strip()
+            enriched = fetch_enrichment_from_source(url) if url else {}
+            return int(row["id"]), enriched or {}
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = [ex.submit(work, r) for r in rows]
+            for fut in as_completed(futures):
+                news_id, enriched = fut.result()
+                if not enriched:
+                    failed += 1
+                    continue
+
+                new_title = (enriched.get("title") or "").strip()
+                new_pub = _normalize_source_published_at(enriched.get("published_at"))
+                new_date = _to_news_date(new_pub) or _to_news_date(enriched.get("published_at"))
+                new_pred = (enriched.get("prediction") or "").strip()
+
+                fields = []
+                params = []
+
+                if new_title and _is_displayable_title(new_title):
+                    fields.append("title = ?")
+                    params.append(new_title)
+                    fields.append("claim_key = ?")
+                    params.append(compute_claim_key(new_title) or None)
+                if new_pub:
+                    fields.append("published_at_source = ?")
+                    params.append(new_pub)
+                if new_date:
+                    fields.append("date = ?")
+                    params.append(new_date)
+                if new_pred in ("Hoax", "Legitimate"):
+                    fields.append("prediction = ?")
+                    params.append(new_pred)
+                    fields.append("confidence = ?")
+                    params.append(1.0)
+
+                if not fields:
+                    failed += 1
+                    continue
+
+                fields.append("updated_at = CURRENT_TIMESTAMP")
+                params.append(news_id)
+                cursor.execute(f"UPDATE news SET {', '.join(fields)} WHERE id = ?", tuple(params))
+                updated += 1
+
+        conn.commit()
+        conn.close()
+
+        record_admin_action(
+            request.current_user["user_id"],
+            "ENRICH_NEWS",
+            f"Enriched recent news rows days={days} limit={limit} updated={updated} failed={failed}",
+        )
+
+        return success_response({"updated": updated, "failed": failed, "days": days, "limit": limit})
+
     except Exception as e:
         return error_response(str(e), 500, traceback.format_exc())
 
@@ -2041,8 +2643,8 @@ def statistics_recent():
         conn = get_connection()
         cursor = conn.cursor()
 
-        source_placeholders = ", ".join("?" for _ in SCRAPER_SOURCE_NAMES)
-        source_params = list(SCRAPER_SOURCE_NAMES)
+        source_clause, source_params = _source_filter_sql()
+        quality_clause, quality_params = _news_quality_filter_sql()
         range_param = f"-{days} days"
         event_ts_sql = """
             COALESCE(
@@ -2058,119 +2660,24 @@ def statistics_recent():
             )
         """
 
-        # Get daily statistics for trending.
         cursor.execute(
             f"""
             SELECT
-                date(datetime({event_ts_sql})) as date,
-                prediction,
-                COUNT(*) as count
+                id, title, claim_key, source, source_url, category, date, published_at_source,
+                prediction, confidence, created_at, updated_at,
+                date(datetime({event_ts_sql})) as event_date
             FROM news
-            WHERE source IN ({source_placeholders})
+            WHERE {source_clause}
+              AND {quality_clause}
               AND datetime({event_ts_sql}) >= datetime('now', ?)
-            GROUP BY date(datetime({event_ts_sql})), prediction
-            ORDER BY date(datetime({event_ts_sql})) DESC
+            ORDER BY datetime({event_ts_sql}) DESC, id DESC
             """,
-            (*source_params, range_param),
+            (*source_params, *quality_params, range_param),
         )
-        daily_stats = list_from_rows(cursor.fetchall())
-
-        # Aggregate by prediction.
-        cursor.execute(
-            f"""
-            SELECT
-                prediction,
-                COUNT(*) as count,
-                AVG(confidence) as avg_confidence
-            FROM news
-            WHERE source IN ({source_placeholders})
-              AND datetime({event_ts_sql}) >= datetime('now', ?)
-            GROUP BY prediction
-            """,
-            (*source_params, range_param),
-        )
-        prediction_stats = list_from_rows(cursor.fetchall())
-
-        # Category distribution.
-        cursor.execute(
-            f"""
-            SELECT
-                category,
-                COUNT(*) as count,
-                AVG(confidence) as avg_confidence
-            FROM news
-            WHERE source IN ({source_placeholders})
-              AND datetime({event_ts_sql}) >= datetime('now', ?)
-            GROUP BY category
-            ORDER BY count DESC
-            """,
-            (*source_params, range_param),
-        )
-        category_stats = list_from_rows(cursor.fetchall())
-
-        # Source distribution for charts.
-        cursor.execute(
-            f"""
-            SELECT
-                source,
-                COUNT(*) as total_count,
-                SUM(CASE WHEN prediction = 'Hoax' THEN 1 ELSE 0 END) as hoax_count,
-                SUM(CASE WHEN prediction = 'Legitimate' THEN 1 ELSE 0 END) as legitimate_count,
-                AVG(confidence) as avg_confidence
-            FROM news
-            WHERE source IN ({source_placeholders})
-              AND datetime({event_ts_sql}) >= datetime('now', ?)
-            GROUP BY source
-            ORDER BY total_count DESC
-            """,
-            (*source_params, range_param),
-        )
-        source_rows = {row["source"]: row for row in list_from_rows(cursor.fetchall())}
-        source_stats = []
-        for source_name in SCRAPER_SOURCE_NAMES:
-            row = source_rows.get(source_name, {})
-            source_stats.append(
-                {
-                    "source": source_name,
-                    "total_count": row.get("total_count", 0) or 0,
-                    "hoax_count": row.get("hoax_count", 0) or 0,
-                    "legitimate_count": row.get("legitimate_count", 0) or 0,
-                    "avg_confidence": float(row.get("avg_confidence") or 0),
-                }
-            )
-
-        # Total statistics.
-        cursor.execute(
-            f"""
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN prediction = 'Hoax' THEN 1 ELSE 0 END) as hoax_count,
-                SUM(CASE WHEN prediction = 'Legitimate' THEN 1 ELSE 0 END) as legitimate_count,
-                AVG(confidence) as avg_confidence
-            FROM news
-            WHERE source IN ({source_placeholders})
-              AND datetime({event_ts_sql}) >= datetime('now', ?)
-            """,
-            (*source_params, range_param),
-        )
-        totals = dict_from_row(cursor.fetchone())
-
+        rows = _sanitize_news_rows(list_from_rows(cursor.fetchall()))
         conn.close()
 
-        return success_response({
-            "totals": {
-                "total_articles": totals['total'] or 0,
-                "hoax_count": totals['hoax_count'] or 0,
-                "legitimate_count": totals['legitimate_count'] or 0,
-                "avg_confidence": round(float(totals['avg_confidence']) if totals['avg_confidence'] else 0, 3),
-                "hoax_percentage": round((totals['hoax_count'] / max(1, totals['total'])) * 100, 2) if totals['total'] else 0
-            },
-            "predictions": prediction_stats,
-            "categories": category_stats,
-            "sources": source_stats,
-            "daily_trend": daily_stats,
-            "period_days": days
-        })
+        return success_response(_compute_consensus_stats(rows, days))
 
     except Exception as e:
         return error_response(str(e), 500)

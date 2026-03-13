@@ -6,6 +6,12 @@ Used for initializing the system with realistic data
 from datetime import datetime, timedelta
 import random
 
+try:
+    from claim_key import compute_claim_key
+except Exception:
+    def compute_claim_key(title: str) -> str:
+        return ""
+
 # Real hoax examples from various Indonesian sources
 SEED_HOAXES = [
     {
@@ -157,10 +163,11 @@ def seed_database():
         
         try:
             cursor.execute("""
-                INSERT INTO news (title, content, source, category, date, prediction, confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO news (title, claim_key, content, source, category, date, prediction, confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 hoax["title"],
+                compute_claim_key(hoax["title"]) or None,
                 hoax["content"],
                 hoax["source"],
                 hoax["category"],

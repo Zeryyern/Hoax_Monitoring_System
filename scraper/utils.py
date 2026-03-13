@@ -27,6 +27,7 @@ def now_utc():
 
 COMMENT_COUNT_PATTERN = re.compile(r"(?i)(?:^|\b)\d+\s*komentar(?:\b|(?=[A-Z]))")
 MULTI_SPACE_PATTERN = re.compile(r"\s+")
+TRAILING_NUMERIC_ID_PATTERN = re.compile(r"\s+\d{5,}\s*$")
 
 
 def clean_scraped_title(title: str) -> str:
@@ -39,6 +40,8 @@ def clean_scraped_title(title: str) -> str:
 
     cleaned = COMMENT_COUNT_PATTERN.sub(" ", title)
     cleaned = cleaned.replace("|", " ").replace("•", " ")
+    # Some sources append long numeric IDs to titles (e.g. Tempo).
+    cleaned = TRAILING_NUMERIC_ID_PATTERN.sub("", cleaned)
     cleaned = MULTI_SPACE_PATTERN.sub(" ", cleaned).strip(" -:;,.")
     return cleaned
 
@@ -108,6 +111,39 @@ def extract_source_published_at(soup) -> str | None:
                 parsed = _safe_parse_datetime(str(item.get(key) or ""))
                 if parsed:
                     return parsed
+
+    return None
+
+
+def extract_source_title(soup) -> str | None:
+    """
+    Extract an article title from common metadata patterns (og:title/title/h1).
+    """
+    if soup is None:
+        return None
+
+    meta = soup.select_one('meta[property="og:title"]')
+    if meta:
+        raw = (meta.get("content") or "").strip()
+        if raw:
+            return raw
+
+    meta = soup.select_one('meta[name="twitter:title"]')
+    if meta:
+        raw = (meta.get("content") or "").strip()
+        if raw:
+            return raw
+
+    if soup.title and soup.title.string:
+        raw = str(soup.title.string).strip()
+        if raw:
+            return raw
+
+    h1 = soup.find("h1")
+    if h1:
+        raw = h1.get_text(" ", strip=True)
+        if raw:
+            return raw
 
     return None
 
