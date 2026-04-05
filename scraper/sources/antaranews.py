@@ -47,7 +47,10 @@ def scrape_antaranews(pages=None, max_pages=100000):
             ],
             session=session,
             required_domain="antaranews.com",
-            url_filter=lambda u: "/berita/" in u,
+            # Antara article detail URLs are generic `/berita/...`, so sitemap-only
+            # discovery pulls unrelated site-wide news. Rely on the Anti-Hoax listing
+            # pages instead of broad sitemap matches.
+            url_filter=lambda u: False,
             max_urls_per_seed=300000,
             max_sitemaps_per_seed=30000,
         )

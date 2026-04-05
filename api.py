@@ -1,5 +1,6 @@
 ﻿from flask import Flask, jsonify, request
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 from analysis.classifier import classify_article, detect_primary_category
 from database import get_connection, init_db, dict_from_row, list_from_rows
 from threading import Thread, Event, Lock
@@ -18,6 +19,7 @@ from config import (
     API_HOST,
     API_PORT,
     DEBUG,
+    TRUST_PROXY_HEADERS,
     SUPER_ADMIN_USERNAME,
     SUPER_ADMIN_EMAIL,
     BOOTSTRAP_ADMIN_ENABLED,
@@ -102,6 +104,8 @@ except Exception as e:
     get_scraper_connection = None
 
 app = Flask(__name__)
+if TRUST_PROXY_HEADERS:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
 # Parse CORS origins
 def _parse_cors_origins(raw_origins: str):
@@ -152,6 +156,9 @@ def add_security_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if request.is_secure:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
 # ===============================
@@ -310,12 +317,13 @@ def _normalize_source_published_at(published_at: Optional[str]) -> Optional[str]
         return None
 
 
-def _source_filter_sql() -> tuple[str, list[str]]:
+def _source_filter_sql(table_alias: str = "") -> tuple[str, list[str]]:
     """Restrict user-facing news endpoints to configured scraper sources."""
     if not SCRAPER_SOURCE_NAMES:
         return "1=0", []
     placeholders = ", ".join("?" for _ in SCRAPER_SOURCE_NAMES)
-    return f"source IN ({placeholders})", list(SCRAPER_SOURCE_NAMES)
+    prefix = f"{table_alias}." if table_alias else ""
+    return f"{prefix}source IN ({placeholders})", list(SCRAPER_SOURCE_NAMES)
 
 
 def _sanitize_news_row(item: dict) -> dict:
@@ -465,6 +473,8 @@ def _persist_scraped_to_news(items: list[dict]) -> int:
                     prediction, confidence = inferred, 1.0
                 else:
                     prediction, confidence = classify_article(title)
+            if prediction != "Hoax":
+                continue
             cursor.execute(
                 """
                 INSERT INTO news (title, claim_key, content, source, source_url, category, date, published_at_source, prediction, confidence)
@@ -557,6 +567,21 @@ class ScrapingManager:
             cleaned = _enrich_from_source_pages(cleaned, source_name)
         elif enrich_missing_published_at is not None:
             cleaned = enrich_missing_published_at(cleaned, source_name)
+
+        hoax_only = []
+        for item in cleaned:
+            prediction = (item.get("prediction") or "").strip()
+            if prediction not in ("Hoax", "Legitimate"):
+                title = (item.get("title") or "").strip()
+                inferred = infer_prediction_from_title(title)
+                if inferred:
+                    prediction = inferred
+                else:
+                    prediction, _ = classify_article(title)
+                item["prediction"] = prediction
+            if prediction == "Hoax":
+                hoax_only.append(item)
+        cleaned = hoax_only
 
         # Log usable collected count (normalized/filtered), not raw link count.
         if raw:
@@ -1121,6 +1146,7 @@ def get_recent_hoaxes():
             FROM news 
             WHERE {source_clause}
               AND {quality_clause}
+              AND prediction = 'Hoax'
             ORDER BY datetime({event_ts_sql}) DESC, id DESC
             LIMIT ?
         """, (*source_params, *quality_params, max(limit * 5, 50)))
@@ -1373,9 +1399,8 @@ def search_hoax_claims():
 
         conn = get_connection()
         cursor = conn.cursor()
-        source_clause_raw, source_params = _source_filter_sql()
+        source_clause, source_params = _source_filter_sql("n")
         # Always apply explicit aliases because the FTS path joins two tables that both include "title".
-        source_clause = source_clause_raw.replace("source", "n.source")
         quality_clause, quality_params = _news_quality_filter_sql("n")
 
         event_ts_sql = """
@@ -1560,11 +1585,10 @@ def get_news():
         conn = get_connection()
         cursor = conn.cursor()
 
-        source_clause, source_params = _source_filter_sql()
-        quality_clause, quality_params = _news_quality_filter_sql()
+        source_clause, source_params = _source_filter_sql("n")
+        quality_clause, quality_params = _news_quality_filter_sql("n")
 
-        # Use aliases to support optional FTS join.
-        where_clauses = [source_clause.replace("source", "n.source"), quality_clause.replace("title", "n.title").replace("source_url", "n.source_url").replace("source", "n.source")]
+        where_clauses = [source_clause, quality_clause]
         params = list(source_params) + list(quality_params)
 
         if category:

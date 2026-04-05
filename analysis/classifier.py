@@ -284,7 +284,8 @@ def classify_article(text: str) -> tuple:
     # Explicit misinformation keywords should force Hoax unless confidence is very strong otherwise.
     explicit_hoax_terms = [
         "hoax", "palsu", "bohong", "false", "fake", "disinformasi",
-        "misinformasi", "menyesatkan", "tidak benar", "cek fakta"
+        "misinformasi", "menyesatkan", "tidak benar", "cek fakta",
+        "keliru", "salah", "fitnah", "sebagian benar"
     ]
     text_lower = text.lower()
     if any(term in text_lower for term in explicit_hoax_terms):

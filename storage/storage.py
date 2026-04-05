@@ -6,16 +6,33 @@ from typing import List, Dict
 from logger import logger
 import json
 from collections import Counter
+from config import DB_PATH as CONFIG_DB_PATH
 
 # Project root
 BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "data" / "hoax.db"
+DB_PATH = Path(CONFIG_DB_PATH)
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA synchronous = NORMAL")
+    except Exception:
+        pass
     return conn
 
 def generate_content_hash(source, title, published_at):

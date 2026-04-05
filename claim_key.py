@@ -39,14 +39,14 @@ def infer_prediction_from_title(title: str) -> str | None:
         if not m:
             break
         tag = m.group(0).strip(" []\t\r\n").lower()
-        if any(k in tag for k in ("hoaks", "hoax", "salah", "misinformasi", "disinformasi", "keliru", "palsu", "fitnah")):
+        if any(k in tag for k in ("hoaks", "hoax", "salah", "misinformasi", "disinformasi", "keliru", "palsu", "fitnah", "menyesatkan", "sebagian benar")):
             return "Hoax"
         if any(k in tag for k in ("fakta", "benar", "valid", "true")):
             return "Legitimate"
         lead = lead[m.end():]
 
     # Fallback: common leading tokens without brackets (conservative).
-    if lowered.startswith(("hoaks", "hoax")):
+    if lowered.startswith(("hoaks", "hoax", "keliru", "salah", "palsu", "fitnah", "disinformasi", "misinformasi", "menyesatkan", "sebagian benar")):
         return "Hoax"
     if lowered.startswith(("fakta", "benar")):
         return "Legitimate"

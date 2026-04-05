@@ -8,12 +8,34 @@ def ensure_data_dir():
     if not exists(DATA_DIR):
         os.makedirs(DATA_DIR, exist_ok=True)
 
+
+def configure_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """Apply production-safe SQLite settings consistently."""
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except Exception:
+        # Some shared/network filesystems do not support WAL; keep startup resilient.
+        pass
+    try:
+        conn.execute("PRAGMA synchronous = NORMAL")
+    except Exception:
+        pass
+    return conn
+
 def get_connection():
     """Get database connection with row factory"""
     ensure_data_dir()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    return configure_connection(conn)
 
 def init_db():
     """Initialize all database tables"""
