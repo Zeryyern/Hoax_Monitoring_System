@@ -1,25 +1,32 @@
-# Node modules / dependencies
-node_modules/
-
 # Python
 __pycache__/
 *.pyc
 venv/
 
-# Environment variables (IMPORTANT for security)
+# Environment / secrets
 .env
-.vscode
-# Logs
-*.log
+.env.local
+.env.development.local
+.env.production.local
 
-# OS files
+# Logs / runtime data
+*.log
+logs/
+data/
+*.db
+
+# Frontend local/build artifacts if copied into this repo
+frontend/node_modules/
+frontend/dist/
+frontend/dist.zip
+frontend/.env.development.local
+frontend/.env.local
+frontend/.env.production.local
+
+# Node modules / dependencies
+node_modules/
+
+# Editor / OS files
+.vscode/
 .DS_Store
 Thumbs.db
-
-# VS Code settings
-.vscode/
-
-#files
-readme.md
-
-hoax.db

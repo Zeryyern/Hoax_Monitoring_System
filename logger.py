@@ -4,8 +4,13 @@ import os
 from datetime import datetime
 import sys
 
-# Ensure logs directory exists
-LOG_DIR = "logs"
+try:
+    from config import LOG_DIR as CONFIG_LOG_DIR
+except Exception:
+    CONFIG_LOG_DIR = "logs"
+
+# Ensure logs directory exists. Prefer configured absolute/persistent path.
+LOG_DIR = os.path.abspath(CONFIG_LOG_DIR or "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # Log file name based on date

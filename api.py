@@ -1432,7 +1432,8 @@ def search_hoax_claims():
                 fts_tokens = tokens or [t for t in re.split(r"\s+", q_key or q_norm) if t]
                 fts_tokens = [t for t in fts_tokens if len(t) >= 2][:10]
                 # Escape quotes to keep MATCH syntax safe.
-                fts_query = " ".join(f"{t.replace('\"', '')}*" for t in fts_tokens) or q_norm.replace('"', "")
+                safe_fts_tokens = [t.replace('"', "") for t in fts_tokens]
+                fts_query = " ".join(f"{t}*" for t in safe_fts_tokens) or q_norm.replace('"', "")
 
                 cursor.execute(
                     f"""
@@ -1619,7 +1620,8 @@ def get_news():
             q_norm = re.sub(r"\\s+", " ", search.strip().casefold())
             q_key = compute_claim_key(search)
             tokens = [t for t in (q_key.split() if q_key else q_norm.split()) if t][:10]
-            fts_query = " ".join(f"{t.replace('\"', '')}*" for t in tokens if len(t) >= 2) or q_norm.replace('"', "")
+            safe_tokens = [t.replace('"', "") for t in tokens if len(t) >= 2]
+            fts_query = " ".join(f"{t}*" for t in safe_tokens) or q_norm.replace('"', "")
 
             if has_fts:
                 # SQLite FTS MATCH requires the real table name (aliases like "f" can break on SQLite).
@@ -3045,4 +3047,3 @@ if __name__ == "__main__":
         serve(app, host=API_HOST, port=API_PORT)
     else:
         app.run(debug=DEBUG, host=API_HOST, port=API_PORT, use_reloader=False)
-
